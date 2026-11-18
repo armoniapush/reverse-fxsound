@@ -5,6 +5,9 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <memory>
 
+//==============================================================================
+// Voger Design Inspired LookAndFeel for Hardware-Grade Skeuomorphic Dials
+//==============================================================================
 class ModernSpatialLookAndFeel : public juce::LookAndFeel_V4
 {
 public:
@@ -12,8 +15,13 @@ public:
     void drawRotarySlider (juce::Graphics& g, int x, int y, int width, int height,
                            float sliderPosProportional, float rotaryStartAngle,
                            float rotaryEndAngle, juce::Slider& slider) override;
+    void drawToggleButton (juce::Graphics& g, juce::ToggleButton& button,
+                           bool shouldDrawButtonAsHighlighted, bool shouldDrawButtonAsDown) override;
 };
 
+//==============================================================================
+// Precision Phase Correlation Bar with Calibration Ticks
+//==============================================================================
 class CorrelationMeterComponent : public juce::Component
 {
 public:
@@ -30,6 +38,9 @@ private:
     float currentValue = 1.0f;
 };
 
+//==============================================================================
+// Holographic Smoked-Glass FFT Spectrum Analyzer
+//==============================================================================
 class SpectrumVisualizerComponent : public juce::Component
 {
 public:
@@ -48,6 +59,9 @@ private:
     float currentCorrelation = 1.0f;
 };
 
+//==============================================================================
+// Main Editor
+//==============================================================================
 class FxSoundAudioProcessorEditor : public juce::AudioProcessorEditor, private juce::Timer
 {
 public:
@@ -66,27 +80,25 @@ private:
     FxSoundAudioProcessor& audioProcessor;
     ModernSpatialLookAndFeel lookAndFeel;
 
-    // Header
+    // Header Console
     juce::Label titleLabel;
     juce::Label badgeLabel;
     juce::ToggleButton powerButton { "POWER" };
     std::unique_ptr<ButtonAttachment> powerAttachment;
 
-    // Master Macro Knob
+    // Hero 3D Spatial Knob
     juce::Slider masterSpatialSlider;
     juce::Label masterSpatialLabel;
     juce::Label masterValueLabel;
     std::unique_ptr<SliderAttachment> spatialAttachment;
 
-    // Real-Time Stylized FFT Spectrum Visualizer
+    // Glass Analyzer Chamber (FFT Spectrum + Phase Bar)
     SpectrumVisualizerComponent spectrumVisualizer;
-
-    // Live Phase Correlation Meter
     CorrelationMeterComponent correlationMeter;
     juce::Label correlationTitleLabel;
     juce::Label correlationReadoutLabel;
 
-    // Bottom Quick-Tweak Controls
+    // Bottom Hardware Rack (4 Precision Dials)
     struct MiniControl
     {
         juce::Slider slider;
