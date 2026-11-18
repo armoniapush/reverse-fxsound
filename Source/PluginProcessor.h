@@ -2,9 +2,41 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_dsp/juce_dsp.h>
-#include <DfxDsp.h>
 #include <vector>
 #include <atomic>
+
+// Schroeder All-Pass Filter for Phase-Coherent Spatial Diffusion
+struct SchroederAllPass
+{
+    std::vector<float> buffer;
+    int maxDelay = 0;
+    int writeIndex = 0;
+    float g = 0.5f;
+
+    void prepare (int delaySamples, float gain)
+    {
+        maxDelay = juce::jmax (1, delaySamples);
+        buffer.assign (maxDelay + 1, 0.0f);
+        g = gain;
+        writeIndex = 0;
+    }
+
+    inline float processSample (float in) noexcept
+    {
+        int readIndex = (writeIndex - maxDelay + static_cast<int> (buffer.size())) % static_cast<int> (buffer.size());
+        float bufOut = buffer[readIndex];
+        float out = -g * in + bufOut;
+        buffer[writeIndex] = in + g * bufOut;
+        writeIndex = (writeIndex + 1) % static_cast<int> (buffer.size());
+        return out;
+    }
+
+    void reset()
+    {
+        std::fill (buffer.begin(), buffer.end(), 0.0f);
+        writeIndex = 0;
+    }
+};
 
 class FxSoundAudioProcessor : public juce::AudioProcessor
 {
@@ -47,34 +79,43 @@ public:
 private:
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
-    // DFX DSP Engine
-    DfxDsp dfxDsp;
-    std::vector<float> interleavedDfxBuffer;
-
     // APVTS
     juce::AudioProcessorValueTreeState apvts;
 
-    // Linkwitz-Riley 4th-Order Tri-Band Crossovers (LR4)
-    juce::dsp::LinkwitzRileyFilter<float> xo1LowL, xo1LowR;
-    juce::dsp::LinkwitzRileyFilter<float> xo1HighL, xo1HighR;
-    juce::dsp::LinkwitzRileyFilter<float> xo2LowL, xo2LowR;
-    juce::dsp::LinkwitzRileyFilter<float> xo2HighL, xo2HighR;
+    // --- Dynamic Phase Architecture (FabFilter Pro-MB Style) ---
+    // 1. Elliptical Filter: High-Pass applied ONLY to Side channel
+    juce::dsp::LinkwitzRileyFilter<float> sideEllipticalHPF;
 
-    // Audio Buffers
-    juce::AudioBuffer<float> lowBuffer;
-    juce::AudioBuffer<float> midBuffer;
-    juce::AudioBuffer<float> highBuffer;
-    juce::AudioBuffer<float> upperBuffer;
+    // 2. Parallel Delta Filters on Side channel
+    juce::dsp::IIR::Filter<float> sidePresenceBP; // 400Hz - 3.5kHz
+    juce::dsp::IIR::Filter<float> sideAirHP;       // > 4kHz
 
-    // Stereoize Phase-Coherent Decorrelator (Ozone Imager Architecture)
-    std::vector<float> decorrBufferL;
-    std::vector<float> decorrBufferR;
-    int decorrWritePos = 0;
-    int decorrDelayL = 0;
-    int decorrDelayR = 0;
-    int decorrBufferSize = 0;
+    // 3. Schroeder Diffuse All-Pass Chain for Spatial Depth
+    static constexpr int numAllPass = 4;
+    std::array<SchroederAllPass, numAllPass> allPassChain;
+    std::vector<float> diffusionPreDelayBuffer;
+    int diffusionPreDelaySamples = 0;
+    int diffusionWritePos = 0;
+    juce::dsp::IIR::Filter<float> diffusionLowPass; // ~9kHz smooth damping
 
-    // FFT Analysis (1024 points, 64 logarithmic display bins)
+    // 4. Crest Factor Transient Detector on Mid channel
+    float peakFastMid = 0.0f;
+    float rmsSlowMid  = 0.0f;
+    float alphaFastAttack = 0.0f;
+    float alphaFastRelease = 0.0f;
+    float alphaRms = 0.0f;
+
+    // 5. Envelope-Follower RMS Correlation Guard
+    float midEnergyRms = 0.0f;
+    float sideEnergyRms = 0.0f;
+    float guardGainSmoothed = 1.0f;
+
+    // 6. Headless Auto-Gain Perceptual Matching
+    float inRmsSmoothed = 0.0f;
+    float outRmsSmoothed = 0.0f;
+    float autoGainFactor = 1.0f;
+
+    // 7. FFT Spectrum Analysis (1024 points)
     static constexpr int fftOrder = 10;
     static constexpr int fftSize = 1 << fftOrder;
     juce::dsp::FFT forwardFFT { fftOrder };
@@ -90,7 +131,7 @@ private:
     void pushNextSampleIntoFifo (float sample) noexcept;
     void processFFT();
 
-    // Real-Time Correlation Calculation
+    // Real-Time Pearson Correlation
     std::atomic<float> liveCorrelation { 1.0f };
     float smoothedCorrelation = 1.0f;
     float sumDot = 0.0f;
@@ -98,27 +139,15 @@ private:
     float sumR2 = 0.0f;
     int correlationSampleCount = 0;
 
-    // Crest Factor & Transient Envelope (Ozone Impact Architecture)
-    float peakFastMid = 0.0f;
-    float rmsSlowMid = 0.0f;
-    float alphaFastAttack = 0.0f;
-    float alphaFastRelease = 0.0f;
-    float alphaRms = 0.0f;
-
-    // Headless Auto-Gain Perceptual Matching (RMS Leveling)
-    float inRmsSmoothed = 0.0f;
-    float outRmsSmoothed = 0.0f;
-    float autoGainFactor = 1.0f;
-
-    // Mastering-Grade Analog Soft Knee (Zero harsh clipping)
+    // Mastering-Grade Analog Soft Knee
     static inline float cleanAnalogSaturation (float x)
     {
-        constexpr float threshold = 0.65f;
+        constexpr float threshold = 0.70f;
         float absX = std::abs (x);
         if (absX <= threshold)
             return x;
         float excess = absX - threshold;
-        float compressed = threshold + 0.30f * std::tanh (excess / 0.30f);
+        float compressed = threshold + 0.28f * std::tanh (excess / 0.28f);
         return (x > 0.0f) ? compressed : -compressed;
     }
 

@@ -46,15 +46,7 @@ FxSoundAudioProcessor::FxSoundAudioProcessor()
                       .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "Parameters", createParameterLayout())
 {
-    xo1LowL.setType (juce::dsp::LinkwitzRileyFilterType::lowpass);
-    xo1LowR.setType (juce::dsp::LinkwitzRileyFilterType::lowpass);
-    xo1HighL.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
-    xo1HighR.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
-
-    xo2LowL.setType (juce::dsp::LinkwitzRileyFilterType::lowpass);
-    xo2LowR.setType (juce::dsp::LinkwitzRileyFilterType::lowpass);
-    xo2HighL.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
-    xo2HighR.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
+    sideEllipticalHPF.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
 }
 
 FxSoundAudioProcessor::~FxSoundAudioProcessor()
@@ -114,59 +106,63 @@ void FxSoundAudioProcessor::changeProgramName (int index, const juce::String& ne
 
 void FxSoundAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    lowBuffer.setSize (2, samplesPerBlock);
-    midBuffer.setSize (2, samplesPerBlock);
-    highBuffer.setSize (2, samplesPerBlock);
-    upperBuffer.setSize (2, samplesPerBlock);
-
     juce::dsp::ProcessSpec spec;
     spec.sampleRate = sampleRate;
     spec.maximumBlockSize = static_cast<juce::uint32> (samplesPerBlock);
     spec.numChannels = 1;
 
-    xo1LowL.prepare (spec);
-    xo1LowR.prepare (spec);
-    xo1HighL.prepare (spec);
-    xo1HighR.prepare (spec);
-
-    xo2LowL.prepare (spec);
-    xo2LowR.prepare (spec);
-    xo2HighL.prepare (spec);
-    xo2HighR.prepare (spec);
-
+    // 1. Elliptical Filter (High-Pass applied ONLY to Side channel)
+    sideEllipticalHPF.prepare (spec);
     float initialCrossover = *apvts.getRawParameterValue ("mono_freq");
-    xo1LowL.setCutoffFrequency (initialCrossover);
-    xo1LowR.setCutoffFrequency (initialCrossover);
-    xo1HighL.setCutoffFrequency (initialCrossover);
-    xo1HighR.setCutoffFrequency (initialCrossover);
+    sideEllipticalHPF.setCutoffFrequency (initialCrossover);
 
-    constexpr float airCrossoverFreq = 3500.0f;
-    xo2LowL.setCutoffFrequency (airCrossoverFreq);
-    xo2LowR.setCutoffFrequency (airCrossoverFreq);
-    xo2HighL.setCutoffFrequency (airCrossoverFreq);
-    xo2HighR.setCutoffFrequency (airCrossoverFreq);
+    // 2. Parallel Delta Filters on Side channel
+    sidePresenceBP.coefficients = juce::dsp::IIR::Coefficients<float>::makeBandPass (sampleRate, 1800.0f, 0.707f);
+    sidePresenceBP.prepare (spec);
+    sidePresenceBP.reset();
 
-    // Decorrelation delay lines for Stereoizer (~7.3ms L, ~11.9ms R)
-    decorrBufferSize = juce::jmax (1024, static_cast<int> (sampleRate * 0.050));
-    decorrBufferL.assign (decorrBufferSize, 0.0f);
-    decorrBufferR.assign (decorrBufferSize, 0.0f);
-    decorrDelayL = static_cast<int> (sampleRate * 0.0073);
-    decorrDelayR = static_cast<int> (sampleRate * 0.0119);
-    decorrWritePos = 0;
+    sideAirHP.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (sampleRate, 4200.0f);
+    sideAirHP.prepare (spec);
+    sideAirHP.reset();
 
-    // Ballistics for Crest Factor & Transient Detector
-    alphaFastAttack  = std::exp (-1.0f / (0.0015f * static_cast<float> (sampleRate)));
-    alphaFastRelease = std::exp (-1.0f / (0.025f * static_cast<float> (sampleRate)));
-    alphaRms         = std::exp (-1.0f / (0.060f * static_cast<float> (sampleRate)));
+    diffusionLowPass.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowPass (sampleRate, 8500.0f);
+    diffusionLowPass.prepare (spec);
+    diffusionLowPass.reset();
+
+    // 3. Schroeder Diffuse All-Pass Chain (Prime delay times in ms: 1.7, 3.1, 5.3, 8.9)
+    constexpr float primeDelaysMs[numAllPass] = { 1.7f, 3.1f, 5.3f, 8.9f };
+    constexpr float allPassGains[numAllPass]  = { 0.50f, 0.50f, 0.45f, 0.40f };
+
+    for (int i = 0; i < numAllPass; ++i)
+    {
+        int delaySamples = static_cast<int> (sampleRate * primeDelaysMs[i] * 0.001f);
+        allPassChain[i].prepare (delaySamples, allPassGains[i]);
+    }
+
+    // Diffusion Pre-Delay Buffer (~18ms)
+    diffusionPreDelaySamples = static_cast<int> (sampleRate * 0.018f);
+    diffusionPreDelayBuffer.assign (juce::jmax (1024, diffusionPreDelaySamples + 1), 0.0f);
+    diffusionWritePos = 0;
+
+    // 4. Ballistics for Crest Factor & Transient Detector
+    alphaFastAttack  = std::exp (-1.0f / (0.002f * static_cast<float> (sampleRate)));
+    alphaFastRelease = std::exp (-1.0f / (0.035f * static_cast<float> (sampleRate)));
+    alphaRms         = std::exp (-1.0f / (0.070f * static_cast<float> (sampleRate)));
 
     peakFastMid = 0.0f;
     rmsSlowMid  = 0.0f;
 
+    // 5. Envelope-Follower RMS Correlation Guard
+    midEnergyRms = 0.0f;
+    sideEnergyRms = 0.0f;
+    guardGainSmoothed = 1.0f;
+
+    // 6. Auto-Gain Perceptual Matching
     inRmsSmoothed  = 0.0f;
     outRmsSmoothed = 0.0f;
     autoGainFactor = 1.0f;
 
-    // FFT visualizer buffers
+    // 7. FFT Spectrum Analysis (1024 points)
     fifoIndex = 0;
     std::fill (std::begin (fifo), std::end (fifo), 0.0f);
     std::fill (std::begin (fftData), std::end (fftData), 0.0f);
@@ -229,12 +225,12 @@ void FxSoundAudioProcessor::copyScopeData (std::array<float, 64>& dest)
 
 void FxSoundAudioProcessor::releaseResources()
 {
-    lowBuffer.setSize (0, 0);
-    midBuffer.setSize (0, 0);
-    highBuffer.setSize (0, 0);
-    upperBuffer.setSize (0, 0);
-    decorrBufferL.clear();
-    decorrBufferR.clear();
+    diffusionPreDelayBuffer.clear();
+    for (auto& ap : allPassChain)
+        ap.reset();
+    sidePresenceBP.reset();
+    sideAirHP.reset();
+    diffusionLowPass.reset();
 }
 
 bool FxSoundAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -273,131 +269,135 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     const float vocalPunchParam = *apvts.getRawParameterValue ("vocal_punch");  // 0.0 to 10.0 (Transient Punch)
     const float monoFreqParam   = *apvts.getRawParameterValue ("mono_freq");    // 80 to 250 Hz
     const float clarityAirParam = *apvts.getRawParameterValue ("clarity_air");  // 0.0 to 10.0
+    const float bassBoostParam  = *apvts.getRawParameterValue ("bass_boost");   // 0.0 to 10.0 (Sub Bass Density)
     const float outputGainDb    = *apvts.getRawParameterValue ("output_gain");   // -12 to +12 dB
+    const bool  guardActive     = *apvts.getRawParameterValue ("guard_active") > 0.5f;
 
-    // Update Crossover 1 Frequency
-    xo1LowL.setCutoffFrequency (monoFreqParam);
-    xo1LowR.setCutoffFrequency (monoFreqParam);
-    xo1HighL.setCutoffFrequency (monoFreqParam);
-    xo1HighR.setCutoffFrequency (monoFreqParam);
-
-    if (lowBuffer.getNumSamples() < numSamples)
-    {
-        lowBuffer.setSize (2, numSamples, false, false, true);
-        midBuffer.setSize (2, numSamples, false, false, true);
-        highBuffer.setSize (2, numSamples, false, false, true);
-        upperBuffer.setSize (2, numSamples, false, false, true);
-    }
+    // Update Elliptical Filter Cutoff smoothly
+    sideEllipticalHPF.setCutoffFrequency (monoFreqParam);
 
     const float* inL = buffer.getReadPointer (0);
     const float* inR = (buffer.getNumChannels() > 1) ? buffer.getReadPointer (1) : inL;
 
-    // 1. Measure Input Energy
+    // 1. Measure Input Energy for Perceptual Auto-Gain
     float inEnergy = 0.0f;
     for (int i = 0; i < numSamples; ++i)
         inEnergy += inL[i] * inL[i] + inR[i] * inR[i];
     float inRms = std::sqrt (inEnergy / (2.0f * numSamples + 1e-9f));
     inRmsSmoothed = (inRmsSmoothed < 1e-6f) ? inRms : (0.97f * inRmsSmoothed + 0.03f * inRms);
 
-    float* lowL   = lowBuffer.getWritePointer (0);
-    float* lowR   = lowBuffer.getWritePointer (1);
-    float* upperL = upperBuffer.getWritePointer (0);
-    float* upperR = upperBuffer.getWritePointer (1);
-    float* midL   = midBuffer.getWritePointer (0);
-    float* midR   = midBuffer.getWritePointer (1);
-    float* highL  = highBuffer.getWritePointer (0);
-    float* highR  = highBuffer.getWritePointer (1);
-
-    // 2. Stage 1 Crossover: Separate Low (< mono_freq) and Upper (> mono_freq)
-    for (int i = 0; i < numSamples; ++i)
-    {
-        lowL[i]   = xo1LowL.processSample (0, inL[i]);
-        lowR[i]   = xo1LowR.processSample (0, inR[i]);
-        upperL[i] = xo1HighL.processSample (0, inL[i]);
-        upperR[i] = xo1HighR.processSample (0, inR[i]);
-
-        // Pure mono anchor for sub-bass
-        float monoLow = (lowL[i] + lowR[i]) * 0.5f;
-        lowL[i] = monoLow;
-        lowR[i] = monoLow;
-    }
-
-    // 3. Stage 2 Crossover: Separate Upper into Mid (mono_freq - 3.5kHz) and Air (> 3.5kHz)
-    for (int i = 0; i < numSamples; ++i)
-    {
-        midL[i]  = xo2LowL.processSample (0, upperL[i]);
-        midR[i]  = xo2LowR.processSample (0, upperR[i]);
-        highL[i] = xo2HighL.processSample (0, upperL[i]);
-        highR[i] = xo2HighR.processSample (0, upperR[i]);
-    }
-
     float* outL = buffer.getWritePointer (0);
     float* outR = (buffer.getNumChannels() > 1) ? buffer.getWritePointer (1) : nullptr;
 
-    const float punchScale = vocalPunchParam * 0.18f;
-    const float airWidthScale = 1.0f + (spatialMacro * 0.12f) + (clarityAirParam * 0.05f);
-    const float stereoizeMidScale = spatialMacro * 0.10f;
-    const float stereoizeAirScale = spatialMacro * 0.16f;
+    const int preDelayBufSize = static_cast<int> (diffusionPreDelayBuffer.size());
+    const float spatialNorm = spatialMacro * 0.10f; // 0.0 to 1.0
+
+    // Coefficients for envelope followers
+    constexpr float alphaEnvAttack  = 0.985f;
+    constexpr float alphaEnvRelease = 0.9992f;
+    constexpr float alphaGuardFast  = 0.980f;
+    constexpr float alphaGuardSlow  = 0.999f;
 
     for (int i = 0; i < numSamples; ++i)
     {
-        // --- A. MID BAND PROCESSING (Vocal & Snare Core) ---
-        float mMid = (midL[i] + midR[i]) * 0.5f;
-        float sMid = (midL[i] - midR[i]) * 0.5f;
+        float xL = inL[i];
+        float xR = inR[i];
 
-        // Stereoizer Decorrelation Line Update
-        decorrBufferL[decorrWritePos] = mMid;
-        decorrBufferR[decorrWritePos] = (highL[i] + highR[i]) * 0.5f;
+        // M/S Encoding
+        float M = (xL + xR) * 0.5f;
+        float S = (xL - xR) * 0.5f;
 
-        int readL = (decorrWritePos - decorrDelayL + decorrBufferSize) % decorrBufferSize;
-        int readR = (decorrWritePos - decorrDelayR + decorrBufferSize) % decorrBufferSize;
-        float dL = decorrBufferL[readL];
-        float dR = decorrBufferR[readR];
-        float sStereoize = (dL - dR) * 0.5f;
-        decorrWritePos = (decorrWritePos + 1) % decorrBufferSize;
-
-        // Crest Factor Detection on Mid channel
-        float absMMid = std::abs (mMid);
-        peakFastMid = (absMMid > peakFastMid)
-                    ? (0.50f * peakFastMid + 0.50f * absMMid)
+        // --- 1. DYNAMIC PHASE MID PROCESSING (Dry Path Intact) ---
+        // Crest Factor Detection
+        float absM = std::abs (M);
+        peakFastMid = (absM > peakFastMid)
+                    ? (alphaFastAttack * peakFastMid + (1.0f - alphaFastAttack) * absM)
                     : (alphaFastRelease * peakFastMid);
-        rmsSlowMid  = alphaRms * rmsSlowMid + (1.0f - alphaRms) * (absMMid * absMMid);
+        rmsSlowMid  = alphaRms * rmsSlowMid + (1.0f - alphaRms) * (absM * absM);
         float rmsMid = std::sqrt (rmsSlowMid + 1e-7f);
         float crestFactor = peakFastMid / (rmsMid + 1e-4f);
 
-        // Dynamic Transient Punch Expansion (0 to +4 dB clean transient attack)
-        float punchBoost = 1.0f;
-        if (crestFactor > 1.15f)
+        // Transient Punch Boost (Mid) & Transient Ducking (Side)
+        float midPunch = 1.0f;
+        float sideDucking = 1.0f;
+        if (crestFactor > 1.20f)
         {
-            float transientExcess = juce::jlimit (0.0f, 2.5f, crestFactor - 1.15f);
-            punchBoost += transientExcess * punchScale;
+            float excess = juce::jlimit (0.0f, 2.5f, crestFactor - 1.20f);
+            midPunch += excess * (vocalPunchParam * 0.06f);
+            // Duck side slightly during attack so vocal/snare cuts dead center
+            sideDucking -= juce::jlimit (0.0f, 0.30f, excess * 0.08f * (vocalPunchParam * 0.1f));
         }
 
-        // Clean analog soft saturation
-        float enhancedMMid = cleanAnalogSaturation (mMid * punchBoost);
+        // Sub Bass Density enhancement on Mid
+        if (bassBoostParam > 0.1f)
+        {
+            // Subtle even harmonic warmth on bass without boominess
+            float bassWarmth = 0.03f * (bassBoostParam * 0.1f) * (M * M * (M > 0.0f ? 1.0f : -1.0f));
+            M += bassWarmth;
+        }
 
-        // Mid Band Side Expansion with Phase-Coherent Stereoizer
-        float desiredSMid = sMid * (1.0f + spatialMacro * 0.05f) + (sStereoize * stereoizeMidScale);
-        float maxAllowedSMid = 0.70f * (std::abs (enhancedMMid) + 1e-4f);
-        float enhancedSMid = juce::jlimit (-maxAllowedSMid, maxAllowedSMid, desiredSMid);
+        float enhancedM = cleanAnalogSaturation (M * midPunch);
 
-        float midOutL = enhancedMMid + enhancedSMid;
-        float midOutR = enhancedMMid - enhancedSMid;
+        // --- 2. DYNAMIC PHASE SIDE PROCESSING (Elliptical + Delta Bands + Schroeder Diffusion) ---
+        // Elliptical High-Pass filter on Side channel ONLY
+        // Below mono_freq, S_mono -> 0, guaranteeing mono bass compatibility
+        float sMono = sideEllipticalHPF.processSample (0, S);
 
-        // --- B. AIR BAND PROCESSING (Spatial Bloom & Shimmer > 3.5kHz) ---
-        float mHigh = (highL[i] + highR[i]) * 0.5f;
-        float sHigh = (highL[i] - highR[i]) * 0.5f;
+        // Presence and Air Delta expansions
+        float deltaPresence = sidePresenceBP.processSample (sMono);
+        float deltaAir      = sideAirHP.processSample (sMono);
 
-        float desiredSHigh = (sHigh * airWidthScale) + (sStereoize * stereoizeAirScale);
-        float maxAllowedSHigh = 0.85f * (std::abs (mHigh) + 1e-4f);
-        float enhancedSHigh = juce::jlimit (-maxAllowedSHigh, maxAllowedSHigh, desiredSHigh);
+        // Schroeder Diffusion Network for 3D depth without comb filtering
+        diffusionPreDelayBuffer[diffusionWritePos] = sMono;
+        int readPos = (diffusionWritePos - diffusionPreDelaySamples + preDelayBufSize) % preDelayBufSize;
+        float delayedS = diffusionPreDelayBuffer[readPos];
+        diffusionWritePos = (diffusionWritePos + 1) % preDelayBufSize;
 
-        float highOutL = mHigh + enhancedSHigh;
-        float highOutR = mHigh - enhancedSHigh;
+        float apOut = delayedS;
+        for (int k = 0; k < numAllPass; ++k)
+            apOut = allPassChain[k].processSample (apOut);
 
-        // --- C. RECONSTRUCTION ---
-        float finalL = lowL[i] + midOutL + highOutL;
-        float finalR = lowR[i] + midOutR + highOutR;
+        float deltaDiffuse = diffusionLowPass.processSample (apOut);
+
+        // Delta Side Summation
+        float deltaS = deltaPresence * (spatialNorm * 0.14f)
+                     + deltaAir * (spatialNorm * 0.22f + clarityAirParam * 0.015f)
+                     + deltaDiffuse * (spatialNorm * 0.16f);
+
+        float sCandidate = (sMono + deltaS) * sideDucking;
+
+        // --- 3. ENVELOPE-FOLLOWER RMS CORRELATION GUARD ---
+        // Mathematical limit: E_S_max = 0.775 * E_M ensures rho >= +0.25
+        float absMidVal  = std::abs (enhancedM);
+        float absSideVal = std::abs (sCandidate);
+
+        midEnergyRms  = (absMidVal > midEnergyRms)
+                      ? (alphaEnvAttack * midEnergyRms + (1.0f - alphaEnvAttack) * absMidVal)
+                      : (alphaEnvRelease * midEnergyRms + (1.0f - alphaEnvRelease) * absMidVal);
+
+        sideEnergyRms = (absSideVal > sideEnergyRms)
+                      ? (alphaEnvAttack * sideEnergyRms + (1.0f - alphaEnvAttack) * absSideVal)
+                      : (alphaEnvRelease * sideEnergyRms + (1.0f - alphaEnvRelease) * absSideVal);
+
+        float targetGuard = 1.0f;
+        if (guardActive && midEnergyRms > 1e-4f)
+        {
+            float maxAllowedSideEnergy = 0.775f * midEnergyRms;
+            if (sideEnergyRms > maxAllowedSideEnergy && sideEnergyRms > 1e-5f)
+                targetGuard = maxAllowedSideEnergy / sideEnergyRms;
+        }
+
+        // Smooth guard gain transition
+        if (targetGuard < guardGainSmoothed)
+            guardGainSmoothed = alphaGuardFast * guardGainSmoothed + (1.0f - alphaGuardFast) * targetGuard;
+        else
+            guardGainSmoothed = alphaGuardSlow * guardGainSmoothed + (1.0f - alphaGuardSlow) * targetGuard;
+
+        float finalS = sCandidate * guardGainSmoothed;
+
+        // --- 4. M/S RECONSTRUCTION ---
+        float finalL = enhancedM + finalS;
+        float finalR = enhancedM - finalS;
 
         outL[i] = finalL;
         if (outR != nullptr)
@@ -413,7 +413,7 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         correlationSampleCount++;
     }
 
-    // 5. Intelligent Perceptual Headroom Auto-Gain (Gentle, Preserving Dynamics)
+    // 5. Headless Auto-Gain Perceptual Matching
     float outEnergy = 0.0f;
     for (int i = 0; i < numSamples; ++i)
         outEnergy += outL[i] * outL[i] + (outR != nullptr ? outR[i] * outR[i] : outL[i] * outL[i]);
@@ -423,7 +423,7 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     if (inRmsSmoothed > 1e-4f && outRmsSmoothed > 1e-4f)
     {
         float targetAutoGain = inRmsSmoothed / outRmsSmoothed;
-        targetAutoGain = juce::jlimit (0.65f, 1.25f, targetAutoGain);
+        targetAutoGain = juce::jlimit (0.70f, 1.25f, targetAutoGain);
         autoGainFactor = 0.98f * autoGainFactor + 0.02f * targetAutoGain;
     }
 

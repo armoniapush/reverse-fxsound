@@ -216,7 +216,7 @@ FxSoundAudioProcessorEditor::FxSoundAudioProcessorEditor (FxSoundAudioProcessor&
     titleLabel.setColour (juce::Label::textColourId, juce::Colour (0xff00e5ff));
     addAndMakeVisible (titleLabel);
 
-    badgeLabel.setText ("BILLBOARD SPATIAL V0.0.5", juce::dontSendNotification);
+    badgeLabel.setText ("BILLBOARD SPATIAL V0.0.6 (DYNAMIC PHASE 3D)", juce::dontSendNotification);
     badgeLabel.setFont (juce::FontOptions (11.0f, juce::Font::bold));
     badgeLabel.setColour (juce::Label::textColourId, juce::Colour (0xffd500f9));
     addAndMakeVisible (badgeLabel);
