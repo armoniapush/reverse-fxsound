@@ -129,15 +129,23 @@ void FxSoundAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
     diffusionLowPass.prepare (spec);
     diffusionLowPass.reset();
 
-    // 3. Ultra-Short Dispersive All-Pass Chain (0.4, 0.9, 1.4, 2.1 ms) -> Surround HRTF without comb-echo
+    // 3. Dynamic DiSP All-Pass Chain (0.4, 0.9, 1.4, 2.1 ms, LFO 0.17-0.34 Hz, excursion 0.20 ms)
     constexpr float primeDelaysMs[numAllPass] = { 0.4f, 0.9f, 1.4f, 2.1f };
-    constexpr float allPassGains[numAllPass]  = { 0.55f, 0.50f, 0.45f, 0.40f };
+    constexpr float lfoFreqsHz[numAllPass]    = { 0.17f, 0.23f, 0.29f, 0.34f };
+    constexpr float initPhases[numAllPass]    = { 0.0f, 1.5708f, 3.1416f, 4.7124f };
+    constexpr float allPassGains[numAllPass]  = { 0.52f, 0.48f, 0.45f, 0.42f };
 
     for (int i = 0; i < numAllPass; ++i)
-    {
-        int delaySamples = juce::jmax (1, static_cast<int> (sampleRate * primeDelaysMs[i] * 0.001f));
-        allPassChain[i].prepare (delaySamples, allPassGains[i]);
-    }
+        allPassChain[i].prepare (sampleRate, primeDelaysMs[i], 0.20f, lfoFreqsHz[i], initPhases[i], allPassGains[i]);
+
+    // 3b. Missing Fundamental Sub-Bass Harmonic Synthesis
+    subBassLPF.coefficients = juce::dsp::IIR::Coefficients<float>::makeLowPass (sampleRate, 100.0f);
+    subBassLPF.prepare (spec);
+    subBassLPF.reset();
+
+    subHarmBPF.coefficients = juce::dsp::IIR::Coefficients<float>::makeBandPass (sampleRate, 230.0f, 0.85f);
+    subHarmBPF.prepare (spec);
+    subHarmBPF.reset();
 
     // 1-pole HPF at 2.5 kHz for clean Mid->Side high-frequency surround halo
     alphaMidAirHp = std::exp (-2.0f * juce::MathConstants<float>::pi * 2500.0f / static_cast<float> (sampleRate));
@@ -308,84 +316,63 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         float M = (xL + xR) * 0.5f;
         float S = (xL - xR) * 0.5f;
 
-        // --- 1. DYNAMIC PHASE MID PROCESSING (Dry Path Intact) ---
-        // Crest Factor Detection
+        // --- 1. SALIENT / DIFFUSE DECOMPOSITION (AES Europe 2025 / US8855320B2) ---
         float absM = std::abs (M);
-        peakFastMid = (absM > peakFastMid)
-                    ? (alphaFastAttack * peakFastMid + (1.0f - alphaFastAttack) * absM)
-                    : (alphaFastRelease * peakFastMid);
-        rmsSlowMid  = alphaRms * rmsSlowMid + (1.0f - alphaRms) * (absM * absM);
-        float rmsMid = std::sqrt (rmsSlowMid + 1e-7f);
-        float crestFactor = peakFastMid / (rmsMid + 1e-4f);
+        peakFastMid = alphaFastAttack * peakFastMid + (1.0f - alphaFastAttack) * absM; // E_fast (~1.5 ms)
+        rmsSlowMid  = alphaFastRelease * rmsSlowMid + (1.0f - alphaFastRelease) * absM; // E_slow (~35-40 ms)
 
-        // Transient Punch Boost (Mid) & Transient Ducking (Side) with dedicated 3ms/45ms smoothing
-        // Integrated into SPATIAL macro + fine-tuned by TRANSIENT PUNCH
-        float effectivePunch = juce::jlimit (0.0f, 1.5f, (spatialNorm * 0.35f) + (vocalPunchParam * 0.10f));
-        float targetMidPunch = 1.0f;
-        float targetSideDuck = 1.0f;
-        if (effectivePunch > 0.02f && crestFactor > 1.25f)
-        {
-            float excess = juce::jlimit (0.0f, 2.0f, crestFactor - 1.25f);
-            targetMidPunch = juce::jlimit (1.0f, 1.28f, 1.0f + excess * effectivePunch * 0.12f); // max +2.1 dB clean
-            targetSideDuck = juce::jlimit (0.82f, 1.0f, 1.0f - excess * effectivePunch * 0.07f); // max -18% smooth duck
-        }
+        // Instantaneous transient mask m_T in [0, 1]
+        float mT = juce::jlimit (0.0f, 1.0f, 2.2f * (peakFastMid - rmsSlowMid) / (peakFastMid + 1e-6f));
+        float mD_factor = 1.0f - mT;
 
-        midPunchSmoothed    = (targetMidPunch > midPunchSmoothed)
-                            ? (alphaPunchAttack * midPunchSmoothed + (1.0f - alphaPunchAttack) * targetMidPunch)
-                            : (alphaPunchRelease * midPunchSmoothed + (1.0f - alphaPunchRelease) * targetMidPunch);
-        sideDuckingSmoothed = (targetSideDuck < sideDuckingSmoothed)
-                            ? (alphaPunchAttack * sideDuckingSmoothed + (1.0f - alphaPunchAttack) * targetSideDuck)
-                            : (alphaPunchRelease * sideDuckingSmoothed + (1.0f - alphaPunchRelease) * targetSideDuck);
-
-        // Sub Bass Density enhancement on Mid
-        if (bassBoostParam > 0.1f)
-        {
-            // Subtle even harmonic warmth on bass without boominess
-            float bassWarmth = 0.03f * (bassBoostParam * 0.1f) * (M * M * (M > 0.0f ? 1.0f : -1.0f));
-            M += bassWarmth;
-        }
-
-        // Subtle silky 8 kHz Air lift on Mid so center & sides share studio sheen
+        // Subtle silky 8 kHz Air lift on Mid
         midAir8kLpState = alphaMidAir8k * midAir8kLpState + (1.0f - alphaMidAir8k) * M;
         float mAir8k = M - midAir8kLpState;
         float midWithAir = M + mAir8k * (spatialNorm * 0.04f + clarityAirParam * 0.008f);
 
-        // Mid contrast (-2.1 dB Surround compensation adapted from FxSound Wide32.c)
-        float midContrast = 1.0f - (spatialNorm * 0.22f);
-        float enhancedM = cleanAnalogSaturation (midWithAir * midPunchSmoothed) * midContrast;
+        // Mid stays 100% phase-intact (0 deg rotation) with gentle Surround contrast
+        float midContrast = 1.0f - (spatialNorm * 0.14f);
+        float enhancedM = cleanAnalogSaturation (midWithAir) * midContrast;
 
-        // --- 2. DYNAMIC PHASE SIDE PROCESSING (Elliptical + Delta Bands + Dispersive HRTF Surround) ---
-        // Elliptical High-Pass filter on Side channel ONLY
-        // Below mono_freq, S_mono -> 0, guaranteeing mono bass compatibility
+        // --- 2. SUB-BASS ELLIPTICAL ANCHOR + MISSING FUNDAMENTAL HARMONIC SYNTHESIS ---
+        // Elliptical LR4 HPF on Side ONLY (< mono_freq -> S=0, rho=+1.00)
         float sMono = sideEllipticalHPF.processSample (0, S);
 
-        // Presence and Air Delta expansions
-        float deltaPresence = sidePresenceBP.processSample (sMono);
-        float deltaAir      = sideAirHP.processSample (sMono);
+        // Missing Fundamental: LPF_100(M) -> tanh(2.2 * B_sub) - B_sub -> BPF_130-380
+        float bSub = subBassLPF.processSample (M);
+        float bHarm = subHarmBPF.processSample (std::tanh (2.2f * bSub) - bSub);
 
-        // High-pass copy of Mid (> 2.5 kHz) for silky 3D wrap-around halo (zero comb-filter on vocal body!)
-        midAirLpState = alphaMidAirHp * midAirLpState + (1.0f - alphaMidAirHp) * M;
-        float mAirOnly = M - midAirLpState;
+        // Partition Side into Salient (untouched dry transient) & Diffuse (spatialized)
+        float sT = mT * sMono;
+        float sD = mD_factor * sMono;
+        float mD = mD_factor * M;
 
-        // Direct Ultra-Short Dispersive All-Pass (0.4-2.1 ms, NO 18 ms echo!)
-        float diffuseInput = sMono + (mAirOnly * 0.40f);
+        // --- 3. DYNAMIC DiSP (LFO-Modulated Comb-Free All-Pass) + DELTA BANDS ---
+        float deltaPresence = sidePresenceBP.processSample (sD);
+        float deltaAir      = sideAirHP.processSample (sD);
+
+        midAirLpState = alphaMidAirHp * midAirLpState + (1.0f - alphaMidAirHp) * mD;
+        float mAirOnly = mD - midAirLpState;
+
+        float diffuseInput = sD + (mAirOnly * 0.42f);
         float apOut = diffuseInput;
         for (int k = 0; k < numAllPass; ++k)
             apOut = allPassChain[k].processSample (apOut);
 
         float deltaDiffuse = diffusionLowPass.processSample (apOut);
 
-        // FxSound Wide32.c Surround + 2026 Billboard Mastering Scaling (8 kHz silky air)
-        float sideBaseGain = 1.0f + (spatialNorm * 2.20f); // up to 3.20x (+10.1 dB Surround separation)
-        float deltaS = deltaPresence * (spatialNorm * 0.45f)
-                     + deltaAir      * (spatialNorm * 0.55f + clarityAirParam * 0.035f)
-                     + deltaDiffuse  * (spatialNorm * 0.35f);
+        // Surround expansion on Diffuse Side + Missing Fundamental Bass Width
+        float sideBaseGain = 1.0f + (spatialNorm * 2.00f); // up to 3.00x on sustained/diffuse Side
+        float deltaS = deltaPresence * (spatialNorm * 0.40f)
+                     + deltaAir      * (spatialNorm * 0.50f + clarityAirParam * 0.035f)
+                     + deltaDiffuse  * (spatialNorm * 0.35f)
+                     + bHarm         * (spatialNorm * 0.25f);
 
-        float sCandidate = (sMono * sideBaseGain + deltaS) * sideDuckingSmoothed;
+        float sD_proc = sD * sideBaseGain + deltaS;
 
-        // --- 3. ENVELOPE-FOLLOWER RMS CORRELATION GUARD (120ms window, 20ms attack, 350ms release) ---
+        // --- 4. CONSTANT-ENERGY PROJECTION & RMS CORRELATION GUARD (rho_min = 0.30 -> E_S,max = 0.734 * E_M) ---
         float absMidVal  = std::abs (enhancedM);
-        float absSideVal = std::abs (sCandidate);
+        float absSideVal = std::abs (sT + sD_proc);
 
         midEnergyRms  = alphaEnvSlow * midEnergyRms  + (1.0f - alphaEnvSlow) * absMidVal;
         sideEnergyRms = alphaEnvSlow * sideEnergyRms + (1.0f - alphaEnvSlow) * absSideVal;
@@ -393,19 +380,18 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         float targetGuard = 1.0f;
         if (guardActive && midEnergyRms > 1e-4f)
         {
-            // Ceiling at 0.92 * E_M: allows full FxSound Surround 3D separation while preventing negative phase cancellation
-            float maxAllowedSideEnergy = 0.92f * midEnergyRms;
+            float maxAllowedSideEnergy = 0.734f * midEnergyRms; // sqrt((1 - 0.30) / (1 + 0.30)) = 0.734
             if (sideEnergyRms > maxAllowedSideEnergy && sideEnergyRms > 1e-5f)
                 targetGuard = maxAllowedSideEnergy / sideEnergyRms;
         }
 
-        // Suavizado musical sin flutter rítmico: ataque 20ms, release 350ms
         if (targetGuard < guardGainSmoothed)
             guardGainSmoothed = alphaGuardAttack * guardGainSmoothed + (1.0f - alphaGuardAttack) * targetGuard;
         else
             guardGainSmoothed = alphaGuardRelease * guardGainSmoothed + (1.0f - alphaGuardRelease) * targetGuard;
 
-        float finalS = sCandidate * guardGainSmoothed;
+        // Reconstruct: S_final = S_T + g_guard * S_D_proc (transients stay 100% untouched!)
+        float finalS = sT + guardGainSmoothed * sD_proc;
 
         // --- 4. M/S RECONSTRUCTION ---
         float finalL = enhancedM + finalS;

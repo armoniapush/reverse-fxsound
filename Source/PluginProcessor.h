@@ -5,29 +5,53 @@
 #include <vector>
 #include <atomic>
 
-// Schroeder All-Pass Filter for Phase-Coherent Spatial Diffusion
-struct SchroederAllPass
+// Dynamic DiSP All-Pass Filter (LFO-modulated fractional delay with linear interpolation)
+struct DynamicSchroederAllPass
 {
     std::vector<float> buffer;
-    int maxDelay = 0;
+    int bufferSize = 0;
     int writeIndex = 0;
+    float baseDelaySamples = 1.0f;
+    float excursionSamples = 0.0f;
+    float lfoPhase = 0.0f;
+    float lfoPhaseInc = 0.0f;
     float g = 0.5f;
 
-    void prepare (int delaySamples, float gain)
+    void prepare (double sampleRate, float baseDelayMs, float excursionMs, float lfoFreqHz, float initialPhaseRad, float gain)
     {
-        maxDelay = juce::jmax (1, delaySamples);
-        buffer.assign (maxDelay + 1, 0.0f);
-        g = gain;
+        baseDelaySamples = juce::jmax (1.0f, static_cast<float> (sampleRate * baseDelayMs * 0.001));
+        excursionSamples = static_cast<float> (sampleRate * excursionMs * 0.001);
+        int maxDelayInt = static_cast<int> (std::ceil (baseDelaySamples + excursionSamples)) + 4;
+        bufferSize = juce::jmax (16, maxDelayInt);
+        buffer.assign (bufferSize, 0.0f);
         writeIndex = 0;
+        lfoPhase = initialPhaseRad;
+        lfoPhaseInc = static_cast<float> (juce::MathConstants<double>::twoPi * lfoFreqHz / sampleRate);
+        g = gain;
     }
 
     inline float processSample (float in) noexcept
     {
-        int readIndex = (writeIndex - maxDelay + static_cast<int> (buffer.size())) % static_cast<int> (buffer.size());
-        float bufOut = buffer[readIndex];
+        // D_k(n) = D_0,k + dD_k * sin(phase)
+        float modDelay = baseDelaySamples + excursionSamples * std::sin (lfoPhase);
+        modDelay = juce::jlimit (1.0f, static_cast<float> (bufferSize - 2), modDelay);
+
+        lfoPhase += lfoPhaseInc;
+        if (lfoPhase >= juce::MathConstants<float>::twoPi)
+            lfoPhase -= juce::MathConstants<float>::twoPi;
+
+        int delayInt = static_cast<int> (modDelay);
+        float frac = modDelay - static_cast<float> (delayInt);
+
+        int idx0 = (writeIndex - delayInt + bufferSize) % bufferSize;
+        int idx1 = (idx0 - 1 + bufferSize) % bufferSize;
+
+        // Linear interpolation
+        float bufOut = buffer[idx0] * (1.0f - frac) + buffer[idx1] * frac;
+
         float out = -g * in + bufOut;
         buffer[writeIndex] = in + g * bufOut;
-        writeIndex = (writeIndex + 1) % static_cast<int> (buffer.size());
+        writeIndex = (writeIndex + 1) % bufferSize;
         return out;
     }
 
@@ -90,15 +114,19 @@ private:
     juce::dsp::IIR::Filter<float> sidePresenceBP; // 400Hz - 3.5kHz
     juce::dsp::IIR::Filter<float> sideAirHP;       // > 4kHz
 
-    // 3. Schroeder Diffuse All-Pass Chain for Spatial Depth
+    // 3. Dynamic DiSP All-Pass Chain (LFO-modulated) for Comb-Free Spatial Depth
     static constexpr int numAllPass = 4;
-    std::array<SchroederAllPass, numAllPass> allPassChain;
+    std::array<DynamicSchroederAllPass, numAllPass> allPassChain;
     std::vector<float> diffusionPreDelayBuffer;
     int diffusionPreDelaySamples = 0;
     int diffusionWritePos = 0;
     juce::dsp::IIR::Filter<float> diffusionLowPass; // ~9kHz smooth damping
     float midAirLpState = 0.0f;
     float alphaMidAirHp = 0.0f;
+
+    // 3b. Missing Fundamental Sub-Bass Harmonic Synthesis (100 Hz LPF -> tanh -> 130-380 Hz BPF)
+    juce::dsp::IIR::Filter<float> subBassLPF;
+    juce::dsp::IIR::Filter<float> subHarmBPF;
 
     // 4. Crest Factor Transient Detector on Mid channel
     float peakFastMid = 0.0f;
