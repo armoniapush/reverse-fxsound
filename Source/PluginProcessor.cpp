@@ -198,6 +198,26 @@ void FxSoundAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
     sumL2 = 0.0f;
     sumR2 = 0.0f;
     correlationSampleCount = 0;
+
+    // 8. STFT + PAE (PCA 2x2) + Binaural Projection Initialization
+    for (int n = 0; n < paeFftSize; ++n)
+        paeWindow[n] = 0.5f * (1.0f - std::cos (juce::MathConstants<float>::twoPi * static_cast<float> (n) / static_cast<float> (paeFftSize)));
+
+    paeInL.fill (0.0f);
+    paeInR.fill (0.0f);
+    paeOutL.fill (0.0f);
+    paeOutR.fill (0.0f);
+    paeFftBufL.fill (0.0f);
+    paeFftBufR.fill (0.0f);
+    scmLL.fill (0.0f);
+    scmRR.fill (0.0f);
+    scmLR_re.fill (0.0f);
+    scmLR_im.fill (0.0f);
+    paeInWritePos = 0;
+    paeOutReadPos = 0;
+    paeHopCounter = 0;
+
+    setLatencySamples (paeFftSize - paeHopSize);
 }
 
 void FxSoundAudioProcessor::pushNextSampleIntoFifo (float sample) noexcept
@@ -268,6 +288,155 @@ bool FxSoundAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) 
     return true;
 }
 
+void FxSoundAudioProcessor::processPaeFrame (float spatialNorm, float monoFreqHz, float clarityAir)
+{
+    const float sr = static_cast<float> (getSampleRate() > 0.0 ? getSampleRate() : 44100.0);
+    const float binHz = sr / static_cast<float> (paeFftSize);
+
+    // 1. Copy windowed input frame from ring buffer
+    paeFftBufL.fill (0.0f);
+    paeFftBufR.fill (0.0f);
+    for (int n = 0; n < paeFftSize; ++n)
+    {
+        int idx = (paeInWritePos + n) % paeFftSize;
+        paeFftBufL[n] = paeInL[idx] * paeWindow[n];
+        paeFftBufR[n] = paeInR[idx] * paeWindow[n];
+    }
+
+    // 2. Forward Real-to-Complex FFT (interleaved complex format in JUCE)
+    paeFft.performRealOnlyForwardTransform (paeFftBufL.data(), true);
+    paeFft.performRealOnlyForwardTransform (paeFftBufR.data(), true);
+
+    constexpr float scmAlpha = 0.85f;
+    constexpr float scmBeta  = 1.0f - scmAlpha;
+    constexpr float headRadius = 0.0875f;
+    constexpr float speedOfSound = 343.0f;
+    constexpr float eps = 1e-12f;
+
+    // 3. Per-bin PAE (2x2 PCA) + Binaural ITD/ILD Projection
+    for (int k = 0; k < paeNumBins; ++k)
+    {
+        float freq = static_cast<float> (k) * binHz;
+        float xL_re = paeFftBufL[2 * k];
+        float xL_im = paeFftBufL[2 * k + 1];
+        float xR_re = paeFftBufR[2 * k];
+        float xR_im = paeFftBufR[2 * k + 1];
+
+        // Update smoothed 2x2 Spatial Covariance Matrix R(k, m)
+        float pLL = xL_re * xL_re + xL_im * xL_im;
+        float pRR = xR_re * xR_re + xR_im * xR_im;
+        float pLR_re = xL_re * xR_re + xL_im * xR_im;
+        float pLR_im = xL_im * xR_re - xL_re * xR_im;
+
+        float rLL = scmAlpha * scmLL[k] + scmBeta * pLL;
+        float rRR = scmAlpha * scmRR[k] + scmBeta * pRR;
+        float rLR_re = scmAlpha * scmLR_re[k] + scmBeta * pLR_re;
+        float rLR_im = scmAlpha * scmLR_im[k] + scmBeta * pLR_im;
+
+        scmLL[k] = rLL;
+        scmRR[k] = rRR;
+        scmLR_re[k] = rLR_re;
+        scmLR_im[k] = rLR_im;
+
+        // Keep sub-bass below monoFreqHz untouched (mono-safe)
+        if (freq < monoFreqHz || spatialNorm <= 0.001f)
+            continue;
+
+        // Dominant eigenvector v1 of 2x2 Hermitian matrix R
+        float tr = rLL + rRR;
+        float diff = rLL - rRR;
+        float magLR2 = rLR_re * rLR_re + rLR_im * rLR_im;
+        float disc = std::sqrt (diff * diff + 4.0f * magLR2);
+        float lambda1 = 0.5f * (tr + disc);
+
+        float v1L_re = 1.0f, v1L_im = 0.0f;
+        float v1R_re = 0.0f, v1R_im = 0.0f;
+
+        if (magLR2 > eps)
+        {
+            float a = lambda1 - rRR;
+            // v1 = [a, conj(rLR)]
+            float norm = std::sqrt (a * a + magLR2 + eps);
+            v1L_re = a / norm;
+            v1L_im = 0.0f;
+            v1R_re = rLR_re / norm;
+            v1R_im = -rLR_im / norm;
+        }
+        else if (rRR > rLL)
+        {
+            v1L_re = 0.0f;
+            v1R_re = 1.0f;
+        }
+
+        // Primary scalar projection: p_s = v1^H * x
+        float ps_re = (v1L_re * xL_re + v1L_im * xL_im) + (v1R_re * xR_re + v1R_im * xR_im);
+        float ps_im = (v1L_re * xL_im - v1L_im * xL_re) + (v1R_re * xR_im - v1R_im * xR_re);
+
+        // Primary vector p = v1 * p_s
+        float pL_re = v1L_re * ps_re - v1L_im * ps_im;
+        float pL_im = v1L_re * ps_im + v1L_im * ps_re;
+        float pR_re = v1R_re * ps_re - v1R_im * ps_im;
+        float pR_im = v1R_re * ps_im + v1R_im * ps_re;
+
+        // Ambient component a = x - p
+        float aL_re = xL_re - pL_re;
+        float aL_im = xL_im - pL_im;
+        float aR_re = xR_re - pR_re;
+        float aR_im = xR_im - pR_im;
+
+        // Panning index in [-1, 1]
+        float eL = v1L_re * v1L_re + v1L_im * v1L_im;
+        float eR = v1R_re * v1R_re + v1R_im * v1R_im;
+        float pan = (eR - eL) / (eL + eR + eps);
+        float absPan = std::abs (pan);
+
+        // Protect center objects (|pan| < 0.18: vocals, kick, bass)
+        float lateralMask = juce::jlimit (0.0f, 1.0f, (absPan - 0.18f) / 0.45f);
+
+        // Woodworth ITD & ILD Binaural Projection for lateral objects
+        float theta = pan * spatialNorm * (juce::MathConstants<float>::halfPi * 0.85f) * lateralMask;
+        float itdSec = (headRadius / speedOfSound) * (theta + std::sin (theta));
+        float halfPhase = juce::MathConstants<float>::pi * freq * itdSec;
+
+        float cosP = std::cos (halfPhase);
+        float sinP = std::sin (halfPhase);
+
+        // Frequency-dependent ILD (head shadow above ~1.5 kHz)
+        float ildShelf = freq / (freq + 1500.0f);
+        float ildDb = 3.5f * spatialNorm * lateralMask * ildShelf * pan;
+        float gainL = std::pow (10.0f, -ildDb * 0.05f);
+        float gainR = std::pow (10.0f,  ildDb * 0.05f);
+
+        // Apply +halfPhase to L, -halfPhase to R (or vice versa via sign of theta)
+        float pL_rot_re = (pL_re * cosP - pL_im * sinP) * gainL;
+        float pL_rot_im = (pL_re * sinP + pL_im * cosP) * gainL;
+        float pR_rot_re = (pR_re * cosP + pR_im * sinP) * gainR;
+        float pR_rot_im = (pR_im * cosP - pR_re * sinP) * gainR;
+
+        // Ambient expansion + gentle high-frequency air boost
+        float airBoost = 1.0f + (freq > 4000.0f ? clarityAir * 0.03f : 0.0f);
+        float ambGain = (1.0f + spatialNorm * 1.35f) * airBoost;
+
+        paeFftBufL[2 * k]     = pL_rot_re + aL_re * ambGain;
+        paeFftBufL[2 * k + 1] = pL_rot_im + aL_im * ambGain;
+        paeFftBufR[2 * k]     = pR_rot_re + aR_re * ambGain;
+        paeFftBufR[2 * k + 1] = pR_rot_im + aR_im * ambGain;
+    }
+
+    // 4. Inverse Real-Only FFT
+    paeFft.performRealOnlyInverseTransform (paeFftBufL.data());
+    paeFft.performRealOnlyInverseTransform (paeFftBufR.data());
+
+    // 5. Overlap-Add (COLA normalization for 75% overlap Hann^2 = 1.5)
+    constexpr float olaNorm = 1.0f / 1.5f;
+    for (int n = 0; n < paeFftSize; ++n)
+    {
+        int idx = (paeOutReadPos + n) % paeFftSize;
+        paeOutL[idx] += paeFftBufL[n] * paeWindow[n] * olaNorm;
+        paeOutR[idx] += paeFftBufR[n] * paeWindow[n] * olaNorm;
+    }
+}
+
 void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
 {
     juce::ignoreUnused (midiMessages);
@@ -312,47 +481,48 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         float xL = inL[i];
         float xR = inR[i];
 
-        // M/S Encoding
-        float M = (xL + xR) * 0.5f;
-        float S = (xL - xR) * 0.5f;
+        // 1. Feed STFT input ring buffer & read overlap-add output
+        paeInL[paeInWritePos] = xL;
+        paeInR[paeInWritePos] = xR;
+        paeInWritePos = (paeInWritePos + 1) % paeFftSize;
 
-        // 1. Mid 100% limpio (sin cleanAnalogSaturation que distorsione masters)
-        float enhancedM = M;
+        float rawL = paeOutL[paeOutReadPos];
+        float rawR = paeOutR[paeOutReadPos];
+        paeOutL[paeOutReadPos] = 0.0f;
+        paeOutR[paeOutReadPos] = 0.0f;
+        paeOutReadPos = (paeOutReadPos + 1) % paeFftSize;
 
-        // 2. Side limpio por encima de mono_freq (sin ducking mT/mD_factor)
-        float sMono = sideEllipticalHPF.processSample (0, S);
+        if (++paeHopCounter >= paeHopSize)
+        {
+            paeHopCounter = 0;
+            processPaeFrame (spatialNorm, monoFreqParam, clarityAirParam);
+        }
 
-        // 3. Bandas paralelas + Armonicos estereo de subgrave (130-380 Hz)
-        float deltaPresence = sidePresenceBP.processSample (sMono);
-        float deltaAir      = sideAirHP.processSample (sMono);
-        float bSub  = subBassLPF.processSample (M);
-        float bHarm = subHarmBPF.processSample (std::tanh (2.5f * bSub) - bSub);
+        // 2. Optional RMS L2 Correlation Guard on M/S
+        if (guardActive)
+        {
+            float M = (rawL + rawR) * 0.5f;
+            float S = (rawL - rawR) * 0.5f;
 
-        // Escalado musical estable (cero ducking)
-        float sExpanded = sMono * (1.0f + spatialNorm * 0.85f)
-                        + deltaPresence * (spatialNorm * 0.25f)
-                        + deltaAir      * (spatialNorm * 0.40f + clarityAirParam * 0.02f)
-                        + bHarm         * (spatialNorm * 0.45f);
+            midEnergyRms  = alphaEnvSlow * midEnergyRms  + (1.0f - alphaEnvSlow) * (M * M);
+            sideEnergyRms = alphaEnvSlow * sideEnergyRms + (1.0f - alphaEnvSlow) * (S * S);
 
-        // 4. Guardia RMS L2 real (rho >= +0.35 garantizado, sin bombeo)
-        midEnergyRms  = alphaEnvSlow * midEnergyRms  + (1.0f - alphaEnvSlow) * (enhancedM * enhancedM);
-        sideEnergyRms = alphaEnvSlow * sideEnergyRms + (1.0f - alphaEnvSlow) * (sExpanded * sExpanded);
+            float midRms  = std::sqrt (midEnergyRms + 1e-9f);
+            float sideRms = std::sqrt (sideEnergyRms + 1e-9f);
+            float maxSide = 0.694f * midRms;
 
-        float midRms  = std::sqrt (midEnergyRms + 1e-9f);
-        float sideRms = std::sqrt (sideEnergyRms + 1e-9f);
-        float maxSide = 0.694f * midRms;
+            float targetGuard = (midRms > 1e-4f && sideRms > maxSide && sideRms > 1e-5f)
+                              ? (maxSide / sideRms)
+                              : 1.0f;
+            float aG = (targetGuard < guardGainSmoothed) ? alphaGuardAttack : alphaGuardRelease;
+            guardGainSmoothed = aG * guardGainSmoothed + (1.0f - aG) * targetGuard;
 
-        float targetGuard = (guardActive && midRms > 1e-4f && sideRms > maxSide && sideRms > 1e-5f)
-                          ? (maxSide / sideRms)
-                          : 1.0f;
-        float aG = (targetGuard < guardGainSmoothed) ? alphaGuardAttack : alphaGuardRelease;
-        guardGainSmoothed = aG * guardGainSmoothed + (1.0f - aG) * targetGuard;
+            float finalS = S * guardGainSmoothed;
+            rawL = M + finalS;
+            rawR = M - finalS;
+        }
 
-        float finalS = sExpanded * guardGainSmoothed;
-        float rawL = enhancedM + finalS;
-        float rawR = enhancedM - finalS;
-
-        // 5. Soft-clipper de seguridad a -0.35 dBFS (cero clipping digital)
+        // 3. Soft-clipper de seguridad a -0.35 dBFS (cero clipping digital)
         auto softLimit = [] (float x) noexcept {
             constexpr float thresh = 0.88f;
             float ax = std::abs (x);

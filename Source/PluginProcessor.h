@@ -149,6 +149,32 @@ private:
     float alphaGuardAttack = 0.0f;
     float alphaGuardRelease = 0.0f;
 
+    // 6. STFT + PAE (PCA 2x2) + Binaural Projection (ITD/ILD)
+    static constexpr int paeFftOrder = 10;
+    static constexpr int paeFftSize  = 1 << paeFftOrder; // 1024
+    static constexpr int paeHopSize  = paeFftSize / 4;   // 256 (75% overlap)
+    static constexpr int paeNumBins  = paeFftSize / 2 + 1;
+
+    juce::dsp::FFT paeFft { paeFftOrder };
+    std::array<float, paeFftSize> paeWindow {};
+    std::array<float, paeFftSize> paeInL {};
+    std::array<float, paeFftSize> paeInR {};
+    std::array<float, paeFftSize> paeOutL {};
+    std::array<float, paeFftSize> paeOutR {};
+    std::array<float, paeFftSize * 2> paeFftBufL {};
+    std::array<float, paeFftSize * 2> paeFftBufR {};
+    int paeInWritePos = 0;
+    int paeOutReadPos = 0;
+    int paeHopCounter = 0;
+
+    // Smoothed 2x2 Spatial Covariance Matrix per bin
+    std::array<float, paeNumBins> scmLL {};
+    std::array<float, paeNumBins> scmRR {};
+    std::array<float, paeNumBins> scmLR_re {};
+    std::array<float, paeNumBins> scmLR_im {};
+
+    void processPaeFrame (float spatialNorm, float monoFreqHz, float clarityAir);
+
     // 6. Headless Auto-Gain Perceptual Matching
     float inRmsSmoothed = 0.0f;
     float outRmsSmoothed = 0.0f;
