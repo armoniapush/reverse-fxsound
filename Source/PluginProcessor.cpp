@@ -129,17 +129,21 @@ void FxSoundAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
     diffusionLowPass.prepare (spec);
     diffusionLowPass.reset();
 
-    // 3. Schroeder Diffuse All-Pass Chain (Prime delay times in ms: 1.7, 3.1, 5.3, 8.9)
-    constexpr float primeDelaysMs[numAllPass] = { 1.7f, 3.1f, 5.3f, 8.9f };
-    constexpr float allPassGains[numAllPass]  = { 0.50f, 0.50f, 0.45f, 0.40f };
+    // 3. Ultra-Short Dispersive All-Pass Chain (0.4, 0.9, 1.4, 2.1 ms) -> Surround HRTF without comb-echo
+    constexpr float primeDelaysMs[numAllPass] = { 0.4f, 0.9f, 1.4f, 2.1f };
+    constexpr float allPassGains[numAllPass]  = { 0.55f, 0.50f, 0.45f, 0.40f };
 
     for (int i = 0; i < numAllPass; ++i)
     {
-        int delaySamples = static_cast<int> (sampleRate * primeDelaysMs[i] * 0.001f);
+        int delaySamples = juce::jmax (1, static_cast<int> (sampleRate * primeDelaysMs[i] * 0.001f));
         allPassChain[i].prepare (delaySamples, allPassGains[i]);
     }
 
-    // Diffusion Pre-Delay Buffer (~18ms)
+    // 1-pole HPF at 2.5 kHz for clean Mid->Side high-frequency surround halo
+    alphaMidAirHp = std::exp (-2.0f * juce::MathConstants<float>::pi * 2500.0f / static_cast<float> (sampleRate));
+    midAirLpState = 0.0f;
+
+    // Diffusion Pre-Delay Buffer kept minimal (unused when direct dispersive is active)
     diffusionPreDelaySamples = static_cast<int> (sampleRate * 0.018f);
     diffusionPreDelayBuffer.assign (juce::jmax (1024, diffusionPreDelaySamples + 1), 0.0f);
     diffusionWritePos = 0;
@@ -285,7 +289,6 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     float* outL = buffer.getWritePointer (0);
     float* outR = (buffer.getNumChannels() > 1) ? buffer.getWritePointer (1) : nullptr;
 
-    const int preDelayBufSize = static_cast<int> (diffusionPreDelayBuffer.size());
     const float spatialNorm = spatialMacro * 0.10f; // 0.0 to 1.0
 
     for (int i = 0; i < numSamples; ++i)
@@ -326,10 +329,11 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
             M += bassWarmth;
         }
 
-        // Mid stays 100% intact (zero attenuation, preserving punch and core volume)
-        float enhancedM = cleanAnalogSaturation (M * midPunch);
+        // Mid contrast (-0.9 dB gentle depth yield at 100% Spatial, keeping vocal & kick solid)
+        float midContrast = 1.0f - (spatialNorm * 0.10f);
+        float enhancedM = cleanAnalogSaturation (M * midPunch) * midContrast;
 
-        // --- 2. DYNAMIC PHASE SIDE PROCESSING (Elliptical + Delta Bands + Schroeder Diffusion) ---
+        // --- 2. DYNAMIC PHASE SIDE PROCESSING (Elliptical + Delta Bands + Dispersive HRTF Surround) ---
         // Elliptical High-Pass filter on Side channel ONLY
         // Below mono_freq, S_mono -> 0, guaranteeing mono bass compatibility
         float sMono = sideEllipticalHPF.processSample (0, S);
@@ -338,24 +342,23 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         float deltaPresence = sidePresenceBP.processSample (sMono);
         float deltaAir      = sideAirHP.processSample (sMono);
 
-        // 2. Difusión SOLO sobre sMono (SIN meter M crudo, eliminando comb-filtering sobre voces)
-        float diffuseInput = sMono;
-        diffusionPreDelayBuffer[diffusionWritePos] = diffuseInput;
-        int readPos = (diffusionWritePos - diffusionPreDelaySamples + preDelayBufSize) % preDelayBufSize;
-        float delayedS = diffusionPreDelayBuffer[readPos];
-        diffusionWritePos = (diffusionWritePos + 1) % preDelayBufSize;
+        // High-pass copy of Mid (> 2.5 kHz) for silky 3D wrap-around halo (zero comb-filter on vocal body!)
+        midAirLpState = alphaMidAirHp * midAirLpState + (1.0f - alphaMidAirHp) * M;
+        float mAirOnly = M - midAirLpState;
 
-        float apOut = delayedS;
+        // Direct Ultra-Short Dispersive All-Pass (0.4-2.1 ms, NO 18 ms echo!)
+        float diffuseInput = sMono + (mAirOnly * 0.40f);
+        float apOut = diffuseInput;
         for (int k = 0; k < numAllPass; ++k)
             apOut = allPassChain[k].processSample (apOut);
 
         float deltaDiffuse = diffusionLowPass.processSample (apOut);
 
-        // 3. Escalado de mastering limpio (espacio amplio sin romper la mezcla)
-        float sideBaseGain = 1.0f + (spatialNorm * 0.65f); // hasta +4.3 dB limpio
-        float deltaS = deltaPresence * (spatialNorm * 0.20f)
-                     + deltaAir      * (spatialNorm * 0.35f + clarityAirParam * 0.03f)
-                     + deltaDiffuse  * (spatialNorm * 0.12f);
+        // FxSound Surround + Billboard Pop Mastering Scaling
+        float sideBaseGain = 1.0f + (spatialNorm * 1.20f); // up to 2.20x (+6.8 dB)
+        float deltaS = deltaPresence * (spatialNorm * 0.35f)
+                     + deltaAir      * (spatialNorm * 0.55f + clarityAirParam * 0.05f)
+                     + deltaDiffuse  * (spatialNorm * 0.30f);
 
         float sCandidate = (sMono * sideBaseGain + deltaS) * sideDucking;
 
@@ -369,8 +372,8 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         float targetGuard = 1.0f;
         if (guardActive && midEnergyRms > 1e-4f)
         {
-            // 4. Guard firme a 0.62 * E_M: asegura correlacion >= +0.35 sin caer a la zona roja
-            float maxAllowedSideEnergy = 0.62f * midEnergyRms;
+            // Ceiling at 0.90 * E_M: allows full Billboard 3D surround while preventing negative phase cancellation (rho >= +0.10)
+            float maxAllowedSideEnergy = 0.90f * midEnergyRms;
             if (sideEnergyRms > maxAllowedSideEnergy && sideEnergyRms > 1e-5f)
                 targetGuard = maxAllowedSideEnergy / sideEnergyRms;
         }

@@ -97,6 +97,8 @@ private:
     int diffusionPreDelaySamples = 0;
     int diffusionWritePos = 0;
     juce::dsp::IIR::Filter<float> diffusionLowPass; // ~9kHz smooth damping
+    float midAirLpState = 0.0f;
+    float alphaMidAirHp = 0.0f;
 
     // 4. Crest Factor Transient Detector on Mid channel
     float peakFastMid = 0.0f;
