@@ -66,17 +66,13 @@ clap_juce_extensions_plugin(TARGET FxSound
     CLAP_FEATURES audio-effect equalizer
 )
 
-# Automatic Post-Build Deployment to System Plugin Directories
+# Automatic Post-Build Deployment to System Plugin Directories (with atomic unlock support)
 add_custom_command(TARGET FxSound_VST3 POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:FxSound_VST3>"
-        "C:/Program Files/Common Files/VST3/FxSound.vst3"
+    COMMAND powershell -NoProfile -Command "try { $dst = 'C:/Program Files/Common Files/VST3/FxSound.vst3'; if (Test-Path $dst) { Move-Item -LiteralPath $dst -Destination ($dst + '.' + [System.Guid]::NewGuid().ToString('N') + '.old') -Force -ErrorAction SilentlyContinue }; Copy-Item -LiteralPath '$<TARGET_FILE:FxSound_VST3>' -Destination $dst -Force } catch {}"
     COMMENT "Auto-deploying VST3 to C:/Program Files/Common Files/VST3/FxSound.vst3"
 )
 
 add_custom_command(TARGET FxSound_CLAP POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:FxSound_CLAP>"
-        "C:/Program Files/Common Files/CLAP/FxSound.clap"
+    COMMAND powershell -NoProfile -Command "try { $dst = 'C:/Program Files/Common Files/CLAP/FxSound.clap'; if (Test-Path $dst) { Move-Item -LiteralPath $dst -Destination ($dst + '.' + [System.Guid]::NewGuid().ToString('N') + '.old') -Force -ErrorAction SilentlyContinue }; Copy-Item -LiteralPath '$<TARGET_FILE:FxSound_CLAP>' -Destination $dst -Force } catch {}"
     COMMENT "Auto-deploying CLAP to C:/Program Files/Common Files/CLAP/FxSound.clap"
 )

@@ -338,6 +338,10 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
 
         float enhancedM = cleanAnalogSaturation (M * midPunch);
 
+        // 1. Mid cede ligeramente al subir Spatial para dar contraste y profundidad (-1.4 dB máx)
+        float midContrast = 1.0f - (spatialNorm * 0.15f);
+        enhancedM *= midContrast;
+
         // --- 2. DYNAMIC PHASE SIDE PROCESSING (Elliptical + Delta Bands + Schroeder Diffusion) ---
         // Elliptical High-Pass filter on Side channel ONLY
         // Below mono_freq, S_mono -> 0, guaranteeing mono bass compatibility
@@ -347,8 +351,10 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         float deltaPresence = sidePresenceBP.processSample (sMono);
         float deltaAir      = sideAirHP.processSample (sMono);
 
-        // Schroeder Diffusion Network for 3D depth without comb filtering
-        diffusionPreDelayBuffer[diffusionWritePos] = sMono;
+        // 2. Alimenta el Pre-Delay + Red Allpass con (M * 0.45f + sMono * 0.55f)
+        //    para crear un halo 3D real incluso alrededor de elementos centrados (100% mono compatible)
+        float diffuseInput = (M * 0.45f) + (sMono * 0.55f);
+        diffusionPreDelayBuffer[diffusionWritePos] = diffuseInput;
         int readPos = (diffusionWritePos - diffusionPreDelaySamples + preDelayBufSize) % preDelayBufSize;
         float delayedS = diffusionPreDelayBuffer[readPos];
         diffusionWritePos = (diffusionWritePos + 1) % preDelayBufSize;
@@ -359,12 +365,13 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
 
         float deltaDiffuse = diffusionLowPass.processSample (apOut);
 
-        // Delta Side Summation
-        float deltaS = deltaPresence * (spatialNorm * 0.14f)
-                     + deltaAir * (spatialNorm * 0.22f + clarityAirParam * 0.015f)
-                     + deltaDiffuse * (spatialNorm * 0.16f);
+        // 3. Ganancia Side banda ancha + bandas Delta con empuje real estilo Billboard
+        float sideBaseGain = 1.0f + (spatialNorm * 1.35f); // hasta 2.35x (+7.4 dB)
+        float deltaS = deltaPresence * (spatialNorm * 0.45f)
+                     + deltaAir      * (spatialNorm * 0.70f + clarityAirParam * 0.04f)
+                     + deltaDiffuse  * (spatialNorm * 0.35f);
 
-        float sCandidate = (sMono + deltaS) * sideDucking;
+        float sCandidate = (sMono * sideBaseGain + deltaS) * sideDucking;
 
         // --- 3. ENVELOPE-FOLLOWER RMS CORRELATION GUARD ---
         // Mathematical limit: E_S_max = 0.775 * E_M ensures rho >= +0.25
