@@ -105,10 +105,13 @@ private:
     float alphaFastRelease = 0.0f;
     float alphaRms = 0.0f;
 
-    // 5. Envelope-Follower RMS Correlation Guard
+    // 5. Envelope-Follower RMS Correlation Guard (Sample-rate dependent musical ballistics)
     float midEnergyRms = 0.0f;
     float sideEnergyRms = 0.0f;
     float guardGainSmoothed = 1.0f;
+    float alphaEnvSlow = 0.0f;
+    float alphaGuardAttack = 0.0f;
+    float alphaGuardRelease = 0.0f;
 
     // 6. Headless Auto-Gain Perceptual Matching
     float inRmsSmoothed = 0.0f;

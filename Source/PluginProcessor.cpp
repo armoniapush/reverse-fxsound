@@ -152,10 +152,13 @@ void FxSoundAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
     peakFastMid = 0.0f;
     rmsSlowMid  = 0.0f;
 
-    // 5. Envelope-Follower RMS Correlation Guard
+    // 5. Envelope-Follower RMS Correlation Guard (Sample-rate dependent musical ballistics)
     midEnergyRms = 0.0f;
     sideEnergyRms = 0.0f;
     guardGainSmoothed = 1.0f;
+    alphaEnvSlow      = std::exp (-1.0f / (0.120f * static_cast<float> (sampleRate))); // 120 ms RMS integration
+    alphaGuardAttack  = std::exp (-1.0f / (0.020f * static_cast<float> (sampleRate))); // 20 ms attack
+    alphaGuardRelease = std::exp (-1.0f / (0.350f * static_cast<float> (sampleRate))); // 350 ms release
 
     // 6. Auto-Gain Perceptual Matching
     inRmsSmoothed  = 0.0f;
@@ -279,24 +282,11 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     const float* inL = buffer.getReadPointer (0);
     const float* inR = (buffer.getNumChannels() > 1) ? buffer.getReadPointer (1) : inL;
 
-    // 1. Measure Input Energy for Perceptual Auto-Gain
-    float inEnergy = 0.0f;
-    for (int i = 0; i < numSamples; ++i)
-        inEnergy += inL[i] * inL[i] + inR[i] * inR[i];
-    float inRms = std::sqrt (inEnergy / (2.0f * numSamples + 1e-9f));
-    inRmsSmoothed = (inRmsSmoothed < 1e-6f) ? inRms : (0.97f * inRmsSmoothed + 0.03f * inRms);
-
     float* outL = buffer.getWritePointer (0);
     float* outR = (buffer.getNumChannels() > 1) ? buffer.getWritePointer (1) : nullptr;
 
     const int preDelayBufSize = static_cast<int> (diffusionPreDelayBuffer.size());
     const float spatialNorm = spatialMacro * 0.10f; // 0.0 to 1.0
-
-    // Coefficients for envelope followers
-    constexpr float alphaEnvAttack  = 0.985f;
-    constexpr float alphaEnvRelease = 0.9992f;
-    constexpr float alphaGuardFast  = 0.980f;
-    constexpr float alphaGuardSlow  = 0.999f;
 
     for (int i = 0; i < numSamples; ++i)
     {
@@ -320,12 +310,12 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         // Transient Punch Boost (Mid) & Transient Ducking (Side)
         float midPunch = 1.0f;
         float sideDucking = 1.0f;
-        if (crestFactor > 1.20f)
+        if (vocalPunchParam > 0.05f && crestFactor > 1.20f)
         {
             float excess = juce::jlimit (0.0f, 2.5f, crestFactor - 1.20f);
             midPunch += excess * (vocalPunchParam * 0.06f);
             // Duck side slightly during attack so vocal/snare cuts dead center
-            sideDucking -= juce::jlimit (0.0f, 0.30f, excess * 0.08f * (vocalPunchParam * 0.1f));
+            sideDucking -= juce::jlimit (0.0f, 0.25f, excess * 0.06f * (vocalPunchParam * 0.1f));
         }
 
         // Sub Bass Density enhancement on Mid
@@ -336,11 +326,8 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
             M += bassWarmth;
         }
 
+        // Mid stays 100% intact (zero attenuation, preserving punch and core volume)
         float enhancedM = cleanAnalogSaturation (M * midPunch);
-
-        // 1. Mid cede ligeramente al subir Spatial para dar contraste y profundidad (-1.4 dB máx)
-        float midContrast = 1.0f - (spatialNorm * 0.15f);
-        enhancedM *= midContrast;
 
         // --- 2. DYNAMIC PHASE SIDE PROCESSING (Elliptical + Delta Bands + Schroeder Diffusion) ---
         // Elliptical High-Pass filter on Side channel ONLY
@@ -351,9 +338,8 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         float deltaPresence = sidePresenceBP.processSample (sMono);
         float deltaAir      = sideAirHP.processSample (sMono);
 
-        // 2. Alimenta el Pre-Delay + Red Allpass con (M * 0.45f + sMono * 0.55f)
-        //    para crear un halo 3D real incluso alrededor de elementos centrados (100% mono compatible)
-        float diffuseInput = (M * 0.45f) + (sMono * 0.55f);
+        // 2. Difusión SOLO sobre sMono (SIN meter M crudo, eliminando comb-filtering sobre voces)
+        float diffuseInput = sMono;
         diffusionPreDelayBuffer[diffusionWritePos] = diffuseInput;
         int readPos = (diffusionWritePos - diffusionPreDelaySamples + preDelayBufSize) % preDelayBufSize;
         float delayedS = diffusionPreDelayBuffer[readPos];
@@ -365,40 +351,35 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
 
         float deltaDiffuse = diffusionLowPass.processSample (apOut);
 
-        // 3. Ganancia Side banda ancha + bandas Delta con empuje real estilo Billboard
-        float sideBaseGain = 1.0f + (spatialNorm * 1.35f); // hasta 2.35x (+7.4 dB)
-        float deltaS = deltaPresence * (spatialNorm * 0.45f)
-                     + deltaAir      * (spatialNorm * 0.70f + clarityAirParam * 0.04f)
-                     + deltaDiffuse  * (spatialNorm * 0.35f);
+        // 3. Escalado de mastering limpio (espacio amplio sin romper la mezcla)
+        float sideBaseGain = 1.0f + (spatialNorm * 0.65f); // hasta +4.3 dB limpio
+        float deltaS = deltaPresence * (spatialNorm * 0.20f)
+                     + deltaAir      * (spatialNorm * 0.35f + clarityAirParam * 0.03f)
+                     + deltaDiffuse  * (spatialNorm * 0.12f);
 
         float sCandidate = (sMono * sideBaseGain + deltaS) * sideDucking;
 
-        // --- 3. ENVELOPE-FOLLOWER RMS CORRELATION GUARD ---
-        // Mathematical limit: E_S_max = 0.775 * E_M ensures rho >= +0.25
+        // --- 3. ENVELOPE-FOLLOWER RMS CORRELATION GUARD (120ms window, 20ms attack, 350ms release) ---
         float absMidVal  = std::abs (enhancedM);
         float absSideVal = std::abs (sCandidate);
 
-        midEnergyRms  = (absMidVal > midEnergyRms)
-                      ? (alphaEnvAttack * midEnergyRms + (1.0f - alphaEnvAttack) * absMidVal)
-                      : (alphaEnvRelease * midEnergyRms + (1.0f - alphaEnvRelease) * absMidVal);
-
-        sideEnergyRms = (absSideVal > sideEnergyRms)
-                      ? (alphaEnvAttack * sideEnergyRms + (1.0f - alphaEnvAttack) * absSideVal)
-                      : (alphaEnvRelease * sideEnergyRms + (1.0f - alphaEnvRelease) * absSideVal);
+        midEnergyRms  = alphaEnvSlow * midEnergyRms  + (1.0f - alphaEnvSlow) * absMidVal;
+        sideEnergyRms = alphaEnvSlow * sideEnergyRms + (1.0f - alphaEnvSlow) * absSideVal;
 
         float targetGuard = 1.0f;
         if (guardActive && midEnergyRms > 1e-4f)
         {
-            float maxAllowedSideEnergy = 0.775f * midEnergyRms;
+            // 4. Guard firme a 0.62 * E_M: asegura correlacion >= +0.35 sin caer a la zona roja
+            float maxAllowedSideEnergy = 0.62f * midEnergyRms;
             if (sideEnergyRms > maxAllowedSideEnergy && sideEnergyRms > 1e-5f)
                 targetGuard = maxAllowedSideEnergy / sideEnergyRms;
         }
 
-        // Smooth guard gain transition
+        // Suavizado musical sin flutter rítmico: ataque 20ms, release 350ms
         if (targetGuard < guardGainSmoothed)
-            guardGainSmoothed = alphaGuardFast * guardGainSmoothed + (1.0f - alphaGuardFast) * targetGuard;
+            guardGainSmoothed = alphaGuardAttack * guardGainSmoothed + (1.0f - alphaGuardAttack) * targetGuard;
         else
-            guardGainSmoothed = alphaGuardSlow * guardGainSmoothed + (1.0f - alphaGuardSlow) * targetGuard;
+            guardGainSmoothed = alphaGuardRelease * guardGainSmoothed + (1.0f - alphaGuardRelease) * targetGuard;
 
         float finalS = sCandidate * guardGainSmoothed;
 
@@ -420,22 +401,10 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         correlationSampleCount++;
     }
 
-    // 5. Headless Auto-Gain Perceptual Matching
-    float outEnergy = 0.0f;
-    for (int i = 0; i < numSamples; ++i)
-        outEnergy += outL[i] * outL[i] + (outR != nullptr ? outR[i] * outR[i] : outL[i] * outL[i]);
-    float outRms = std::sqrt (outEnergy / (2.0f * numSamples + 1e-9f));
-    outRmsSmoothed = (outRmsSmoothed < 1e-6f) ? outRms : (0.97f * outRmsSmoothed + 0.03f * outRms);
-
-    if (inRmsSmoothed > 1e-4f && outRmsSmoothed > 1e-4f)
-    {
-        float targetAutoGain = inRmsSmoothed / outRmsSmoothed;
-        targetAutoGain = juce::jlimit (0.70f, 1.25f, targetAutoGain);
-        autoGainFactor = 0.98f * autoGainFactor + 0.02f * targetAutoGain;
-    }
-
+    // 5. Output Master Trim (Dynamic Auto-Gain is removed to prevent all pumping)
     float masterTrim = juce::Decibels::decibelsToGain (outputGainDb);
-    buffer.applyGain (autoGainFactor * masterTrim);
+    if (std::abs (outputGainDb) > 0.01f)
+        buffer.applyGain (masterTrim);
 
     // 6. Real-Time Phase Correlation Calculation
     if (correlationSampleCount >= 512)
