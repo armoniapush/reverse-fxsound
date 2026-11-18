@@ -106,6 +106,12 @@ private:
     float alphaFastAttack = 0.0f;
     float alphaFastRelease = 0.0f;
     float alphaRms = 0.0f;
+    float midPunchSmoothed = 1.0f;
+    float sideDuckingSmoothed = 1.0f;
+    float alphaPunchAttack = 0.0f;
+    float alphaPunchRelease = 0.0f;
+    float midAir8kLpState = 0.0f;
+    float alphaMidAir8k = 0.0f;
 
     // 5. Envelope-Follower RMS Correlation Guard (Sample-rate dependent musical ballistics)
     float midEnergyRms = 0.0f;

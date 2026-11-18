@@ -121,7 +121,7 @@ void FxSoundAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
     sidePresenceBP.prepare (spec);
     sidePresenceBP.reset();
 
-    sideAirHP.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (sampleRate, 4200.0f);
+    sideAirHP.coefficients = juce::dsp::IIR::Coefficients<float>::makeHighPass (sampleRate, 8000.0f);
     sideAirHP.prepare (spec);
     sideAirHP.reset();
 
@@ -152,6 +152,14 @@ void FxSoundAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
     alphaFastAttack  = std::exp (-1.0f / (0.002f * static_cast<float> (sampleRate)));
     alphaFastRelease = std::exp (-1.0f / (0.035f * static_cast<float> (sampleRate)));
     alphaRms         = std::exp (-1.0f / (0.070f * static_cast<float> (sampleRate)));
+
+    alphaPunchAttack  = std::exp (-1.0f / (0.003f * static_cast<float> (sampleRate))); // 3 ms
+    alphaPunchRelease = std::exp (-1.0f / (0.045f * static_cast<float> (sampleRate))); // 45 ms
+    midPunchSmoothed    = 1.0f;
+    sideDuckingSmoothed = 1.0f;
+
+    alphaMidAir8k  = std::exp (-2.0f * juce::MathConstants<float>::pi * 8000.0f / static_cast<float> (sampleRate));
+    midAir8kLpState = 0.0f;
 
     peakFastMid = 0.0f;
     rmsSlowMid  = 0.0f;
@@ -310,16 +318,24 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         float rmsMid = std::sqrt (rmsSlowMid + 1e-7f);
         float crestFactor = peakFastMid / (rmsMid + 1e-4f);
 
-        // Transient Punch Boost (Mid) & Transient Ducking (Side)
-        float midPunch = 1.0f;
-        float sideDucking = 1.0f;
-        if (vocalPunchParam > 0.05f && crestFactor > 1.20f)
+        // Transient Punch Boost (Mid) & Transient Ducking (Side) with dedicated 3ms/45ms smoothing
+        // Integrated into SPATIAL macro + fine-tuned by TRANSIENT PUNCH
+        float effectivePunch = juce::jlimit (0.0f, 1.5f, (spatialNorm * 0.35f) + (vocalPunchParam * 0.10f));
+        float targetMidPunch = 1.0f;
+        float targetSideDuck = 1.0f;
+        if (effectivePunch > 0.02f && crestFactor > 1.25f)
         {
-            float excess = juce::jlimit (0.0f, 2.5f, crestFactor - 1.20f);
-            midPunch += excess * (vocalPunchParam * 0.06f);
-            // Duck side slightly during attack so vocal/snare cuts dead center
-            sideDucking -= juce::jlimit (0.0f, 0.25f, excess * 0.06f * (vocalPunchParam * 0.1f));
+            float excess = juce::jlimit (0.0f, 2.0f, crestFactor - 1.25f);
+            targetMidPunch = juce::jlimit (1.0f, 1.28f, 1.0f + excess * effectivePunch * 0.12f); // max +2.1 dB clean
+            targetSideDuck = juce::jlimit (0.82f, 1.0f, 1.0f - excess * effectivePunch * 0.07f); // max -18% smooth duck
         }
+
+        midPunchSmoothed    = (targetMidPunch > midPunchSmoothed)
+                            ? (alphaPunchAttack * midPunchSmoothed + (1.0f - alphaPunchAttack) * targetMidPunch)
+                            : (alphaPunchRelease * midPunchSmoothed + (1.0f - alphaPunchRelease) * targetMidPunch);
+        sideDuckingSmoothed = (targetSideDuck < sideDuckingSmoothed)
+                            ? (alphaPunchAttack * sideDuckingSmoothed + (1.0f - alphaPunchAttack) * targetSideDuck)
+                            : (alphaPunchRelease * sideDuckingSmoothed + (1.0f - alphaPunchRelease) * targetSideDuck);
 
         // Sub Bass Density enhancement on Mid
         if (bassBoostParam > 0.1f)
@@ -329,9 +345,14 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
             M += bassWarmth;
         }
 
+        // Subtle silky 8 kHz Air lift on Mid so center & sides share studio sheen
+        midAir8kLpState = alphaMidAir8k * midAir8kLpState + (1.0f - alphaMidAir8k) * M;
+        float mAir8k = M - midAir8kLpState;
+        float midWithAir = M + mAir8k * (spatialNorm * 0.04f + clarityAirParam * 0.008f);
+
         // Mid contrast (-0.9 dB gentle depth yield at 100% Spatial, keeping vocal & kick solid)
         float midContrast = 1.0f - (spatialNorm * 0.10f);
-        float enhancedM = cleanAnalogSaturation (M * midPunch) * midContrast;
+        float enhancedM = cleanAnalogSaturation (midWithAir * midPunchSmoothed) * midContrast;
 
         // --- 2. DYNAMIC PHASE SIDE PROCESSING (Elliptical + Delta Bands + Dispersive HRTF Surround) ---
         // Elliptical High-Pass filter on Side channel ONLY
@@ -354,13 +375,13 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
 
         float deltaDiffuse = diffusionLowPass.processSample (apOut);
 
-        // FxSound Surround + Billboard Pop Mastering Scaling
-        float sideBaseGain = 1.0f + (spatialNorm * 1.20f); // up to 2.20x (+6.8 dB)
-        float deltaS = deltaPresence * (spatialNorm * 0.35f)
-                     + deltaAir      * (spatialNorm * 0.55f + clarityAirParam * 0.05f)
-                     + deltaDiffuse  * (spatialNorm * 0.30f);
+        // FxSound Surround + Billboard Pop Mastering Scaling (8 kHz silky air)
+        float sideBaseGain = 1.0f + (spatialNorm * 1.10f); // up to 2.10x (+6.4 dB)
+        float deltaS = deltaPresence * (spatialNorm * 0.30f)
+                     + deltaAir      * (spatialNorm * 0.45f + clarityAirParam * 0.035f)
+                     + deltaDiffuse  * (spatialNorm * 0.28f);
 
-        float sCandidate = (sMono * sideBaseGain + deltaS) * sideDucking;
+        float sCandidate = (sMono * sideBaseGain + deltaS) * sideDuckingSmoothed;
 
         // --- 3. ENVELOPE-FOLLOWER RMS CORRELATION GUARD (120ms window, 20ms attack, 350ms release) ---
         float absMidVal  = std::abs (enhancedM);
@@ -372,8 +393,8 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         float targetGuard = 1.0f;
         if (guardActive && midEnergyRms > 1e-4f)
         {
-            // Ceiling at 0.90 * E_M: allows full Billboard 3D surround while preventing negative phase cancellation (rho >= +0.10)
-            float maxAllowedSideEnergy = 0.90f * midEnergyRms;
+            // Ceiling at 0.70 * E_M: keeps correlation >= +0.34 safely above zero even on fast transients
+            float maxAllowedSideEnergy = 0.70f * midEnergyRms;
             if (sideEnergyRms > maxAllowedSideEnergy && sideEnergyRms > 1e-5f)
                 targetGuard = maxAllowedSideEnergy / sideEnergyRms;
         }
