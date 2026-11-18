@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "x64dbg": {
+      "command": "node",
+      "args": [
+        "C:\\Users\\armon\\tools\\x64dbg_mcp\\server\\dist\\index.js"
+      ]
+    },
+    "ida": {
+      "command": "C:\\Users\\armon\\.local\\bin\\ida-mcp.exe",
+      "args": ["stdio"]
+    },
+    "ida-pro": {
+      "command": "C:\\Users\\armon\\.local\\bin\\ida-pro-mcp.exe",
+      "args": []
+    },
+    "rea": {
+      "command": "cmd",
+      "args": ["/c", "rea", "--mcp"]
+    }
+  }
+}
