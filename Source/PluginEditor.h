@@ -30,6 +30,24 @@ private:
     float currentValue = 1.0f;
 };
 
+class SpectrumVisualizerComponent : public juce::Component
+{
+public:
+    SpectrumVisualizerComponent() = default;
+    void updateData (const std::array<float, 64>& data, float correlation)
+    {
+        levels = data;
+        currentCorrelation = correlation;
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override;
+
+private:
+    std::array<float, 64> levels {};
+    float currentCorrelation = 1.0f;
+};
+
 class FxSoundAudioProcessorEditor : public juce::AudioProcessorEditor, private juce::Timer
 {
 public:
@@ -59,6 +77,9 @@ private:
     juce::Label masterSpatialLabel;
     juce::Label masterValueLabel;
     std::unique_ptr<SliderAttachment> spatialAttachment;
+
+    // Real-Time Stylized FFT Spectrum Visualizer
+    SpectrumVisualizerComponent spectrumVisualizer;
 
     // Live Phase Correlation Meter
     CorrelationMeterComponent correlationMeter;

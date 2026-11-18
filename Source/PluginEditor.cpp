@@ -133,6 +133,75 @@ void CorrelationMeterComponent::paint (juce::Graphics& g)
 }
 
 //==============================================================================
+// SpectrumVisualizerComponent
+//==============================================================================
+
+void SpectrumVisualizerComponent::paint (juce::Graphics& g)
+{
+    auto bounds = getLocalBounds().toFloat();
+    float w = bounds.getWidth();
+    float h = bounds.getHeight();
+
+    // Dark sleek background with subtle glow
+    g.setColour (juce::Colour (0xff0a0d14));
+    g.fillRoundedRectangle (bounds, 8.0f);
+    g.setColour (juce::Colour (0xff1e2638));
+    g.drawRoundedRectangle (bounds.reduced (0.5f), 8.0f, 1.0f);
+
+    // Subtle Frequency grid guide lines (100 Hz, 1 kHz, 10 kHz)
+    g.setColour (juce::Colour (0xff182030));
+    g.drawVerticalLine (static_cast<int> (w * 0.20f), 4.0f, h - 4.0f);
+    g.drawVerticalLine (static_cast<int> (w * 0.50f), 4.0f, h - 4.0f);
+    g.drawVerticalLine (static_cast<int> (w * 0.80f), 4.0f, h - 4.0f);
+
+    // Determine colors according to live correlation
+    juce::Colour primaryColor, secondaryColor;
+    if (currentCorrelation >= 0.70f)
+    {
+        primaryColor   = juce::Colour (0xff00e5ff); // Cyan
+        secondaryColor = juce::Colour (0xff00e676); // Green
+    }
+    else if (currentCorrelation >= 0.35f)
+    {
+        primaryColor   = juce::Colour (0xffd500f9); // Neon Purple
+        secondaryColor = juce::Colour (0xff00e5ff); // Cyan
+    }
+    else
+    {
+        primaryColor   = juce::Colour (0xffff9100); // Amber Caution
+        secondaryColor = juce::Colour (0xffff1744); // Red
+    }
+
+    // Build smooth spectrum path
+    juce::Path spectrumPath;
+    float dx = w / 63.0f;
+    for (int i = 0; i < 64; ++i)
+    {
+        float x = i * dx;
+        float y = h - (levels[i] * (h - 10.0f) + 5.0f);
+        if (i == 0)
+            spectrumPath.startNewSubPath (x, y);
+        else
+            spectrumPath.lineTo (x, y);
+    }
+
+    // Filled Gradient under curve
+    juce::Path filledPath = spectrumPath;
+    filledPath.lineTo (w, h);
+    filledPath.lineTo (0.0f, h);
+    filledPath.closeSubPath();
+
+    juce::ColourGradient fillGrad (primaryColor.withAlpha (0.28f), 0.0f, 0.0f,
+                                  secondaryColor.withAlpha (0.03f), 0.0f, h, false);
+    g.setGradientFill (fillGrad);
+    g.fillPath (filledPath);
+
+    // Glowing Neon Stroke
+    g.setColour (primaryColor.withAlpha (0.95f));
+    g.strokePath (spectrumPath, juce::PathStrokeType (2.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+}
+
+//==============================================================================
 // Editor
 //==============================================================================
 
@@ -147,10 +216,13 @@ FxSoundAudioProcessorEditor::FxSoundAudioProcessorEditor (FxSoundAudioProcessor&
     titleLabel.setColour (juce::Label::textColourId, juce::Colour (0xff00e5ff));
     addAndMakeVisible (titleLabel);
 
-    badgeLabel.setText ("BILLBOARD SPATIAL V0.0.4 (SPECTRAL TRANSIENT)", juce::dontSendNotification);
+    badgeLabel.setText ("BILLBOARD SPATIAL V0.0.5", juce::dontSendNotification);
     badgeLabel.setFont (juce::FontOptions (11.0f, juce::Font::bold));
     badgeLabel.setColour (juce::Label::textColourId, juce::Colour (0xffd500f9));
     addAndMakeVisible (badgeLabel);
+
+    // Spectrum Visualizer
+    addAndMakeVisible (spectrumVisualizer);
 
     // Power Button
     powerButton.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
@@ -203,8 +275,8 @@ FxSoundAudioProcessorEditor::FxSoundAudioProcessorEditor (FxSoundAudioProcessor&
     setupMiniDial (clarityAirCtrl, "clarity_air", "CLARITY AIR",  "");
     setupMiniDial (outputGainCtrl, "output_gain", "OUTPUT",       " dB");
 
-    setSize (580, 500);
-    startTimerHz (30); // 30 FPS update for phase meter
+    setSize (600, 560);
+    startTimerHz (30); // 30 FPS update for phase meter & FFT
 }
 
 FxSoundAudioProcessorEditor::~FxSoundAudioProcessorEditor()
@@ -250,6 +322,11 @@ void FxSoundAudioProcessorEditor::timerCallback()
     float corr = audioProcessor.getLiveCorrelation();
     correlationMeter.setCorrelation (corr);
 
+    // Update FFT Spectrum Visualizer
+    std::array<float, 64> scopeLevels;
+    audioProcessor.copyScopeData (scopeLevels);
+    spectrumVisualizer.updateData (scopeLevels, corr);
+
     juce::String statusText;
     juce::Colour statusColor;
     if (corr >= 0.70f)
@@ -279,19 +356,19 @@ void FxSoundAudioProcessorEditor::paint (juce::Graphics& g)
 
     // Top Header
     g.setColour (juce::Colour (0xff14171d));
-    g.fillRect (0, 0, getWidth(), 60);
+    g.fillRect (0, 0, getWidth(), 50);
     g.setColour (juce::Colour (0xff1e232c));
-    g.drawHorizontalLine (60, 0.0f, static_cast<float> (getWidth()));
+    g.drawHorizontalLine (50, 0.0f, static_cast<float> (getWidth()));
 
     // Master Hero Section
-    auto heroRect = juce::Rectangle<int> (20, 75, getWidth() - 40, 240);
+    auto heroRect = juce::Rectangle<int> (20, 155, getWidth() - 40, 195);
     g.setColour (juce::Colour (0xff14171d));
     g.fillRoundedRectangle (heroRect.toFloat(), 10.0f);
     g.setColour (juce::Colour (0xff252a34));
     g.drawRoundedRectangle (heroRect.toFloat(), 10.0f, 1.0f);
 
     // Bottom Tweak Section
-    auto tweakRect = juce::Rectangle<int> (20, 365, getWidth() - 40, 115);
+    auto tweakRect = juce::Rectangle<int> (20, 415, getWidth() - 40, 125);
     g.setColour (juce::Colour (0xff14171d));
     g.fillRoundedRectangle (tweakRect.toFloat(), 10.0f);
     g.setColour (juce::Colour (0xff252a34));
@@ -301,25 +378,28 @@ void FxSoundAudioProcessorEditor::paint (juce::Graphics& g)
 void FxSoundAudioProcessorEditor::resized()
 {
     // Header
-    titleLabel.setBounds (20, 10, 140, 24);
-    badgeLabel.setBounds (22, 34, 200, 16);
-    powerButton.setBounds (getWidth() - 110, 16, 90, 28);
+    titleLabel.setBounds (20, 8, 140, 22);
+    badgeLabel.setBounds (22, 28, 280, 16);
+    powerButton.setBounds (getWidth() - 110, 10, 90, 28);
+
+    // Real-Time FFT Spectrum Visualizer
+    spectrumVisualizer.setBounds (20, 54, getWidth() - 40, 90);
 
     // Master Knob
-    int knobSize = 160;
+    int knobSize = 145;
     int centerX = getWidth() / 2;
-    masterSpatialSlider.setBounds (centerX - knobSize / 2, 90, knobSize, knobSize);
-    masterValueLabel.setBounds (centerX - 50, 155, 100, 26);
-    masterSpatialLabel.setBounds (centerX - 60, 255, 120, 20);
+    masterSpatialSlider.setBounds (centerX - knobSize / 2, 165, knobSize, knobSize);
+    masterValueLabel.setBounds (centerX - 50, 225, 100, 26);
+    masterSpatialLabel.setBounds (centerX - 60, 318, 120, 20);
 
     // Phase Correlation Meter
-    int meterY = 325;
+    int meterY = 360;
     correlationTitleLabel.setBounds (24, meterY, 150, 16);
     correlationReadoutLabel.setBounds (getWidth() - 250, meterY, 226, 16);
-    correlationMeter.setBounds (24, meterY + 20, getWidth() - 48, 12);
+    correlationMeter.setBounds (24, meterY + 18, getWidth() - 48, 14);
 
     // Bottom Controls (4 Dials)
-    int dockY = 378;
+    int dockY = 425;
     int colWidth = (getWidth() - 40) / 4;
 
     std::vector<MiniControl*> dials = { &vocalPunchCtrl, &monoFreqCtrl, &clarityAirCtrl, &outputGainCtrl };
@@ -327,7 +407,7 @@ void FxSoundAudioProcessorEditor::resized()
     {
         int x = 20 + static_cast<int> (i) * colWidth;
         dials[i]->title.setBounds (x, dockY, colWidth, 14);
-        dials[i]->slider.setBounds (x + (colWidth - 56) / 2, dockY + 16, 56, 56);
-        dials[i]->valLabel.setBounds (x, dockY + 74, colWidth, 14);
+        dials[i]->slider.setBounds (x + (colWidth - 56) / 2, dockY + 18, 56, 56);
+        dials[i]->valLabel.setBounds (x, dockY + 80, colWidth, 14);
     }
 }

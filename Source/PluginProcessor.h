@@ -41,6 +41,9 @@ public:
     juce::AudioProcessorValueTreeState& getAPVTS() { return apvts; }
     float getLiveCorrelation() const { return liveCorrelation.load (std::memory_order_relaxed); }
 
+    // Visual FFT Data for UI
+    void copyScopeData (std::array<float, 64>& dest);
+
 private:
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
@@ -52,19 +55,40 @@ private:
     juce::AudioProcessorValueTreeState apvts;
 
     // Linkwitz-Riley 4th-Order Tri-Band Crossovers (LR4)
-    // Crossover 1: Splits Low (< mono_freq) and Upper (> mono_freq)
     juce::dsp::LinkwitzRileyFilter<float> xo1LowL, xo1LowR;
     juce::dsp::LinkwitzRileyFilter<float> xo1HighL, xo1HighR;
-
-    // Crossover 2: Splits Upper into Mid (mono_freq to 3.5kHz) and High/Air (> 3.5kHz)
     juce::dsp::LinkwitzRileyFilter<float> xo2LowL, xo2LowR;
     juce::dsp::LinkwitzRileyFilter<float> xo2HighL, xo2HighR;
 
-    // Audio Buffers for Tri-Band Routing
+    // Audio Buffers
     juce::AudioBuffer<float> lowBuffer;
     juce::AudioBuffer<float> midBuffer;
     juce::AudioBuffer<float> highBuffer;
     juce::AudioBuffer<float> upperBuffer;
+
+    // Stereoize Phase-Coherent Decorrelator (Ozone Imager Architecture)
+    std::vector<float> decorrBufferL;
+    std::vector<float> decorrBufferR;
+    int decorrWritePos = 0;
+    int decorrDelayL = 0;
+    int decorrDelayR = 0;
+    int decorrBufferSize = 0;
+
+    // FFT Analysis (1024 points, 64 logarithmic display bins)
+    static constexpr int fftOrder = 10;
+    static constexpr int fftSize = 1 << fftOrder;
+    juce::dsp::FFT forwardFFT { fftOrder };
+    juce::dsp::WindowingFunction<float> window { fftSize, juce::dsp::WindowingFunction<float>::hann };
+
+    float fifo [fftSize] {};
+    float fftData [2 * fftSize] {};
+    int fifoIndex = 0;
+    std::atomic<bool> nextFFTBlockReady { false };
+    std::array<float, 64> scopeLevels {};
+    juce::SpinLock scopeLock;
+
+    void pushNextSampleIntoFifo (float sample) noexcept;
+    void processFFT();
 
     // Real-Time Correlation Calculation
     std::atomic<float> liveCorrelation { 1.0f };
@@ -89,12 +113,12 @@ private:
     // Mastering-Grade Analog Soft Knee (Zero harsh clipping)
     static inline float cleanAnalogSaturation (float x)
     {
-        constexpr float threshold = 0.70f;
+        constexpr float threshold = 0.65f;
         float absX = std::abs (x);
         if (absX <= threshold)
             return x;
         float excess = absX - threshold;
-        float compressed = threshold + 0.28f * std::tanh (excess / 0.28f);
+        float compressed = threshold + 0.30f * std::tanh (excess / 0.30f);
         return (x > 0.0f) ? compressed : -compressed;
     }
 
