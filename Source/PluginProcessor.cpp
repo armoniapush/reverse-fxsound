@@ -330,8 +330,8 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         float mAir8k = M - midAir8kLpState;
         float midWithAir = M + mAir8k * (spatialNorm * 0.04f + clarityAirParam * 0.008f);
 
-        // Mid stays 100% phase-intact (0 deg rotation) with gentle Surround contrast
-        float midContrast = 1.0f - (spatialNorm * 0.14f);
+        // Mid stays 100% phase-intact (0 deg rotation) with FxSound Wide32.c Surround contrast (-2.1 dB)
+        float midContrast = 1.0f - (spatialNorm * 0.22f);
         float enhancedM = cleanAnalogSaturation (midWithAir) * midContrast;
 
         // --- 2. SUB-BASS ELLIPTICAL ANCHOR + MISSING FUNDAMENTAL HARMONIC SYNTHESIS ---
@@ -362,15 +362,15 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         float deltaDiffuse = diffusionLowPass.processSample (apOut);
 
         // Surround expansion on Diffuse Side + Missing Fundamental Bass Width
-        float sideBaseGain = 1.0f + (spatialNorm * 2.00f); // up to 3.00x on sustained/diffuse Side
-        float deltaS = deltaPresence * (spatialNorm * 0.40f)
-                     + deltaAir      * (spatialNorm * 0.50f + clarityAirParam * 0.035f)
-                     + deltaDiffuse  * (spatialNorm * 0.35f)
-                     + bHarm         * (spatialNorm * 0.25f);
+        float sideBaseGain = 1.0f + (spatialNorm * 2.50f); // up to 3.50x (+10.9 dB) on sustained/diffuse Side
+        float deltaS = deltaPresence * (spatialNorm * 0.45f)
+                     + deltaAir      * (spatialNorm * 0.55f + clarityAirParam * 0.035f)
+                     + deltaDiffuse  * (spatialNorm * 0.45f)
+                     + bHarm         * (spatialNorm * 0.30f);
 
         float sD_proc = sD * sideBaseGain + deltaS;
 
-        // --- 4. CONSTANT-ENERGY PROJECTION & RMS CORRELATION GUARD (rho_min = 0.30 -> E_S,max = 0.734 * E_M) ---
+        // --- 4. CONSTANT-ENERGY PROJECTION & RMS CORRELATION GUARD (rho_min = 0.05 -> E_S,max = 0.95 * E_M) ---
         float absMidVal  = std::abs (enhancedM);
         float absSideVal = std::abs (sT + sD_proc);
 
@@ -380,7 +380,7 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         float targetGuard = 1.0f;
         if (guardActive && midEnergyRms > 1e-4f)
         {
-            float maxAllowedSideEnergy = 0.734f * midEnergyRms; // sqrt((1 - 0.30) / (1 + 0.30)) = 0.734
+            float maxAllowedSideEnergy = 0.95f * midEnergyRms; // Only prevents negative phase cancellation (rho < 0), never chokes SPATIAL!
             if (sideEnergyRms > maxAllowedSideEnergy && sideEnergyRms > 1e-5f)
                 targetGuard = maxAllowedSideEnergy / sideEnergyRms;
         }
