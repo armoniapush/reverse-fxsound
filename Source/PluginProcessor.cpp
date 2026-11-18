@@ -350,8 +350,8 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         float mAir8k = M - midAir8kLpState;
         float midWithAir = M + mAir8k * (spatialNorm * 0.04f + clarityAirParam * 0.008f);
 
-        // Mid contrast (-0.9 dB gentle depth yield at 100% Spatial, keeping vocal & kick solid)
-        float midContrast = 1.0f - (spatialNorm * 0.10f);
+        // Mid contrast (-2.1 dB Surround compensation adapted from FxSound Wide32.c)
+        float midContrast = 1.0f - (spatialNorm * 0.22f);
         float enhancedM = cleanAnalogSaturation (midWithAir * midPunchSmoothed) * midContrast;
 
         // --- 2. DYNAMIC PHASE SIDE PROCESSING (Elliptical + Delta Bands + Dispersive HRTF Surround) ---
@@ -375,11 +375,11 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
 
         float deltaDiffuse = diffusionLowPass.processSample (apOut);
 
-        // FxSound Surround + Billboard Pop Mastering Scaling (8 kHz silky air)
-        float sideBaseGain = 1.0f + (spatialNorm * 1.10f); // up to 2.10x (+6.4 dB)
-        float deltaS = deltaPresence * (spatialNorm * 0.30f)
-                     + deltaAir      * (spatialNorm * 0.45f + clarityAirParam * 0.035f)
-                     + deltaDiffuse  * (spatialNorm * 0.28f);
+        // FxSound Wide32.c Surround + 2026 Billboard Mastering Scaling (8 kHz silky air)
+        float sideBaseGain = 1.0f + (spatialNorm * 2.20f); // up to 3.20x (+10.1 dB Surround separation)
+        float deltaS = deltaPresence * (spatialNorm * 0.45f)
+                     + deltaAir      * (spatialNorm * 0.55f + clarityAirParam * 0.035f)
+                     + deltaDiffuse  * (spatialNorm * 0.35f);
 
         float sCandidate = (sMono * sideBaseGain + deltaS) * sideDuckingSmoothed;
 
@@ -393,8 +393,8 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         float targetGuard = 1.0f;
         if (guardActive && midEnergyRms > 1e-4f)
         {
-            // Ceiling at 0.70 * E_M: keeps correlation >= +0.34 safely above zero even on fast transients
-            float maxAllowedSideEnergy = 0.70f * midEnergyRms;
+            // Ceiling at 0.92 * E_M: allows full FxSound Surround 3D separation while preventing negative phase cancellation
+            float maxAllowedSideEnergy = 0.92f * midEnergyRms;
             if (sideEnergyRms > maxAllowedSideEnergy && sideEnergyRms > 1e-5f)
                 targetGuard = maxAllowedSideEnergy / sideEnergyRms;
         }

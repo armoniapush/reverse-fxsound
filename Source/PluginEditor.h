@@ -98,21 +98,5 @@ private:
     juce::Label correlationTitleLabel;
     juce::Label correlationReadoutLabel;
 
-    // Bottom Hardware Rack (4 Precision Dials)
-    struct MiniControl
-    {
-        juce::Slider slider;
-        juce::Label title;
-        juce::Label valLabel;
-        std::unique_ptr<SliderAttachment> attachment;
-    };
-
-    MiniControl vocalPunchCtrl;
-    MiniControl monoFreqCtrl;
-    MiniControl clarityAirCtrl;
-    MiniControl outputGainCtrl;
-
-    void setupMiniDial (MiniControl& ctrl, const juce::String& paramId, const juce::String& title, const juce::String& suffix = "");
-
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FxSoundAudioProcessorEditor)
 };

@@ -389,7 +389,7 @@ FxSoundAudioProcessorEditor::FxSoundAudioProcessorEditor (FxSoundAudioProcessor&
     titleLabel.setColour (juce::Label::textColourId, juce::Colour (0xff00f0ff));
     addAndMakeVisible (titleLabel);
 
-    badgeLabel.setText ("BILLBOARD SPATIAL V0.0.7 (DYNAMIC PHASE 3D)", juce::dontSendNotification);
+    badgeLabel.setText ("BILLBOARD SPATIAL V0.0.8 (SURROUND 3D)", juce::dontSendNotification);
     badgeLabel.setFont (juce::FontOptions (10.5f, juce::Font::bold));
     badgeLabel.setColour (juce::Label::textColourId, juce::Colour (0xffc084fc));
     addAndMakeVisible (badgeLabel);
@@ -438,14 +438,8 @@ FxSoundAudioProcessorEditor::FxSoundAudioProcessorEditor (FxSoundAudioProcessor&
     spatialAttachment = std::make_unique<SliderAttachment> (audioProcessor.getAPVTS(), "spatial", masterSpatialSlider);
     masterSpatialSlider.onValueChange();
 
-    // Bottom Hardware Console
-    setupMiniDial (vocalPunchCtrl, "vocal_punch", "TRANSIENT PUNCH", "");
-    setupMiniDial (monoFreqCtrl,   "mono_freq",   "MONO BASS",       " Hz");
-    setupMiniDial (clarityAirCtrl, "clarity_air", "CLARITY AIR",     "");
-    setupMiniDial (outputGainCtrl, "output_gain", "OUTPUT",          " dB");
-
-    // Grid Dimensions: 620 x 590
-    setSize (620, 590);
+    // Grid Dimensions: 620 x 450 (Single-Knob Mastering Console)
+    setSize (620, 450);
     startTimerHz (30);
 }
 
@@ -453,38 +447,6 @@ FxSoundAudioProcessorEditor::~FxSoundAudioProcessorEditor()
 {
     stopTimer();
     setLookAndFeel (nullptr);
-}
-
-void FxSoundAudioProcessorEditor::setupMiniDial (MiniControl& ctrl, const juce::String& paramId, const juce::String& title, const juce::String& suffix)
-{
-    ctrl.slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-    ctrl.slider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
-    ctrl.slider.setRotaryParameters (juce::MathConstants<float>::pi * 1.25f, juce::MathConstants<float>::pi * 2.75f, true);
-    addAndMakeVisible (ctrl.slider);
-
-    ctrl.title.setText (title, juce::dontSendNotification);
-    ctrl.title.setFont (juce::FontOptions (10.5f, juce::Font::bold));
-    ctrl.title.setJustificationType (juce::Justification::centred);
-    ctrl.title.setColour (juce::Label::textColourId, juce::Colour (0xff7a8ba3));
-    addAndMakeVisible (ctrl.title);
-
-    ctrl.valLabel.setFont (juce::FontOptions (11.5f, juce::Font::bold));
-    ctrl.valLabel.setJustificationType (juce::Justification::centred);
-    ctrl.valLabel.setColour (juce::Label::textColourId, juce::Colour (0xffe6edf8));
-    addAndMakeVisible (ctrl.valLabel);
-
-    ctrl.slider.onValueChange = [&ctrl, suffix]() {
-        float val = static_cast<float> (ctrl.slider.getValue());
-        if (suffix == " Hz")
-            ctrl.valLabel.setText (juce::String (static_cast<int> (val)) + suffix, juce::dontSendNotification);
-        else if (suffix == " dB")
-            ctrl.valLabel.setText ((val > 0.0f ? "+" : "") + juce::String (val, 1) + suffix, juce::dontSendNotification);
-        else
-            ctrl.valLabel.setText (juce::String (val, 1) + suffix, juce::dontSendNotification);
-    };
-
-    ctrl.attachment = std::make_unique<SliderAttachment> (audioProcessor.getAPVTS(), paramId, ctrl.slider);
-    ctrl.slider.onValueChange();
 }
 
 void FxSoundAudioProcessorEditor::timerCallback()
@@ -544,33 +506,6 @@ void FxSoundAudioProcessorEditor::paint (juce::Graphics& g)
                                      juce::Colour (0xff0e131b), 0.0f, static_cast<float> (heroRect.getBottom()), false);
     g.setGradientFill (heroBorder);
     g.drawRoundedRectangle (heroRect.toFloat(), 10.0f, 1.2f);
-
-    // --- 3. BOTTOM HARDWARE CONSOLE BAY (4 MICRO DIALS) ---
-    auto rackRect = juce::Rectangle<int> (20, 438, getWidth() - 40, 134);
-    juce::ColourGradient rackGrad (juce::Colour (0xff0f131c), 0.0f, static_cast<float> (rackRect.getY()),
-                                   juce::Colour (0xff090c12), 0.0f, static_cast<float> (rackRect.getBottom()), false);
-    g.setGradientFill (rackGrad);
-    g.fillRoundedRectangle (rackRect.toFloat(), 10.0f);
-
-    juce::ColourGradient rackBorder (juce::Colour (0xff242f42), 0.0f, static_cast<float> (rackRect.getY()),
-                                     juce::Colour (0xff0d1118), 0.0f, static_cast<float> (rackRect.getBottom()), false);
-    g.setGradientFill (rackBorder);
-    g.drawRoundedRectangle (rackRect.toFloat(), 10.0f, 1.2f);
-
-    // Voger Hardware Details: 4 Precision Chassis Screws at Rack Corners
-    auto drawScrew = [&g](float cx, float cy) {
-        g.setColour (juce::Colour (0xff121620));
-        g.fillEllipse (cx - 4.0f, cy - 4.0f, 8.0f, 8.0f);
-        g.setColour (juce::Colour (0xff2d3a4e));
-        g.drawEllipse (cx - 4.0f, cy - 4.0f, 8.0f, 8.0f, 1.0f);
-        g.setColour (juce::Colour (0xff080a0f));
-        g.drawLine (cx - 2.2f, cy - 2.2f, cx + 2.2f, cy + 2.2f, 1.2f);
-    };
-
-    drawScrew (rackRect.getX() + 10.0f, rackRect.getY() + 10.0f);
-    drawScrew (rackRect.getRight() - 10.0f, rackRect.getY() + 10.0f);
-    drawScrew (rackRect.getX() + 10.0f, rackRect.getBottom() - 10.0f);
-    drawScrew (rackRect.getRight() - 10.0f, rackRect.getBottom() - 10.0f);
 }
 
 void FxSoundAudioProcessorEditor::resized()
@@ -595,17 +530,4 @@ void FxSoundAudioProcessorEditor::resized()
     masterSpatialSlider.setBounds (centerX - knobSize / 2, 218, knobSize, knobSize);
     masterValueLabel.setBounds (centerX - 50, 284, 100, 28);
     masterSpatialLabel.setBounds (centerX - 60, 396, 120, 20);
-
-    // --- 4. BOTTOM 4-CHANNEL HARDWARE BAY ---
-    int dockY = 448;
-    int colWidth = (getWidth() - 40) / 4;
-
-    std::vector<MiniControl*> dials = { &vocalPunchCtrl, &monoFreqCtrl, &clarityAirCtrl, &outputGainCtrl };
-    for (size_t i = 0; i < dials.size(); ++i)
-    {
-        int x = 20 + static_cast<int> (i) * colWidth;
-        dials[i]->title.setBounds (x, dockY, colWidth, 14);
-        dials[i]->slider.setBounds (x + (colWidth - 62) / 2, dockY + 18, 62, 62);
-        dials[i]->valLabel.setBounds (x, dockY + 86, colWidth, 16);
-    }
 }
