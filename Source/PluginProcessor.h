@@ -51,16 +51,20 @@ private:
     // APVTS
     juce::AudioProcessorValueTreeState apvts;
 
-    // Linkwitz-Riley 4th-Order Crossover (LR4)
-    juce::dsp::LinkwitzRileyFilter<float> lowPassL, lowPassR;
-    juce::dsp::LinkwitzRileyFilter<float> highPassL, highPassR;
+    // Linkwitz-Riley 4th-Order Tri-Band Crossovers (LR4)
+    // Crossover 1: Splits Low (< mono_freq) and Upper (> mono_freq)
+    juce::dsp::LinkwitzRileyFilter<float> xo1LowL, xo1LowR;
+    juce::dsp::LinkwitzRileyFilter<float> xo1HighL, xo1HighR;
 
-    // Vocal Mid-Channel Bandpass (Spectre-style)
-    juce::dsp::IIR::Filter<float> midBandpass;
+    // Crossover 2: Splits Upper into Mid (mono_freq to 3.5kHz) and High/Air (> 3.5kHz)
+    juce::dsp::LinkwitzRileyFilter<float> xo2LowL, xo2LowR;
+    juce::dsp::LinkwitzRileyFilter<float> xo2HighL, xo2HighR;
 
-    // Audio Buffers for multiband routing
+    // Audio Buffers for Tri-Band Routing
     juce::AudioBuffer<float> lowBuffer;
+    juce::AudioBuffer<float> midBuffer;
     juce::AudioBuffer<float> highBuffer;
+    juce::AudioBuffer<float> upperBuffer;
 
     // Real-Time Correlation Calculation
     std::atomic<float> liveCorrelation { 1.0f };
@@ -70,27 +74,28 @@ private:
     float sumR2 = 0.0f;
     int correlationSampleCount = 0;
 
-    // Transient & Sustain Dual Envelope Follower (Ozone 12 architecture)
-    float envFast = 0.0f;
-    float envSlow = 0.0f;
-    float alphaFast = 0.0f;
-    float alphaSlow = 0.0f;
+    // Crest Factor & Transient Envelope (Ozone Impact Architecture)
+    float peakFastMid = 0.0f;
+    float rmsSlowMid = 0.0f;
+    float alphaFastAttack = 0.0f;
+    float alphaFastRelease = 0.0f;
+    float alphaRms = 0.0f;
 
     // Headless Auto-Gain Perceptual Matching (RMS Leveling)
     float inRmsSmoothed = 0.0f;
     float outRmsSmoothed = 0.0f;
     float autoGainFactor = 1.0f;
 
-    // Headless Adaptive Phase Guard
-    float phaseGuardDucking = 1.0f;
-
-    // Solid Saturation Function
-    static inline float applySolidSaturation (float sample, float drive)
+    // Mastering-Grade Analog Soft Knee (Zero harsh clipping)
+    static inline float cleanAnalogSaturation (float x)
     {
-        float in = sample * drive;
-        // Transistor soft-knee transfer function with 3rd-order harmonic dominance
-        float sat = std::tanh (in) + 0.12f * (in * in * (in > 0.0f ? 1.0f : -1.0f));
-        return sat * 0.88f;
+        constexpr float threshold = 0.70f;
+        float absX = std::abs (x);
+        if (absX <= threshold)
+            return x;
+        float excess = absX - threshold;
+        float compressed = threshold + 0.28f * std::tanh (excess / 0.28f);
+        return (x > 0.0f) ? compressed : -compressed;
     }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FxSoundAudioProcessor)

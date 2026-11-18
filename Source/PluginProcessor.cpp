@@ -46,13 +46,15 @@ FxSoundAudioProcessor::FxSoundAudioProcessor()
                       .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "Parameters", createParameterLayout())
 {
-    lowPassL.setType (juce::dsp::LinkwitzRileyFilterType::lowpass);
-    lowPassR.setType (juce::dsp::LinkwitzRileyFilterType::lowpass);
-    highPassL.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
-    highPassR.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
+    xo1LowL.setType (juce::dsp::LinkwitzRileyFilterType::lowpass);
+    xo1LowR.setType (juce::dsp::LinkwitzRileyFilterType::lowpass);
+    xo1HighL.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
+    xo1HighR.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
 
-    dfxDsp.powerOn (true);
-    dfxDsp.eqOn (true);
+    xo2LowL.setType (juce::dsp::LinkwitzRileyFilterType::lowpass);
+    xo2LowR.setType (juce::dsp::LinkwitzRileyFilterType::lowpass);
+    xo2HighL.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
+    xo2HighR.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
 }
 
 FxSoundAudioProcessor::~FxSoundAudioProcessor()
@@ -112,48 +114,49 @@ void FxSoundAudioProcessor::changeProgramName (int index, const juce::String& ne
 
 void FxSoundAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    // Configure FxSound DSP Engine
-    dfxDsp.setSignalFormat (32, 2, static_cast<int> (sampleRate), 32);
-    dfxDsp.powerOn (true);
-    dfxDsp.eqOn (true);
-
-    interleavedDfxBuffer.resize (static_cast<size_t> (samplesPerBlock * 2));
     lowBuffer.setSize (2, samplesPerBlock);
+    midBuffer.setSize (2, samplesPerBlock);
     highBuffer.setSize (2, samplesPerBlock);
+    upperBuffer.setSize (2, samplesPerBlock);
 
-    // Prepare Linkwitz-Riley Crossover Filters
     juce::dsp::ProcessSpec spec;
     spec.sampleRate = sampleRate;
     spec.maximumBlockSize = static_cast<juce::uint32> (samplesPerBlock);
     spec.numChannels = 1;
 
-    lowPassL.prepare (spec);
-    lowPassR.prepare (spec);
-    highPassL.prepare (spec);
-    highPassR.prepare (spec);
+    xo1LowL.prepare (spec);
+    xo1LowR.prepare (spec);
+    xo1HighL.prepare (spec);
+    xo1HighR.prepare (spec);
+
+    xo2LowL.prepare (spec);
+    xo2LowR.prepare (spec);
+    xo2HighL.prepare (spec);
+    xo2HighR.prepare (spec);
 
     float initialCrossover = *apvts.getRawParameterValue ("mono_freq");
-    lowPassL.setCutoffFrequency (initialCrossover);
-    lowPassR.setCutoffFrequency (initialCrossover);
-    highPassL.setCutoffFrequency (initialCrossover);
-    highPassR.setCutoffFrequency (initialCrossover);
+    xo1LowL.setCutoffFrequency (initialCrossover);
+    xo1LowR.setCutoffFrequency (initialCrossover);
+    xo1HighL.setCutoffFrequency (initialCrossover);
+    xo1HighR.setCutoffFrequency (initialCrossover);
 
-    // Prepare Vocal Mid-Channel Bandpass (Spectre-style: ~935 Hz, Q=0.71)
-    auto coeffs = juce::dsp::IIR::Coefficients<float>::makeBandPass (sampleRate, 935.0f, 0.71f);
-    midBandpass.coefficients = coeffs;
-    midBandpass.reset();
+    constexpr float airCrossoverFreq = 3500.0f;
+    xo2LowL.setCutoffFrequency (airCrossoverFreq);
+    xo2LowR.setCutoffFrequency (airCrossoverFreq);
+    xo2HighL.setCutoffFrequency (airCrossoverFreq);
+    xo2HighR.setCutoffFrequency (airCrossoverFreq);
 
-    // Transient & Sustain Dual Envelope Follower (Fast ~2ms, Slow ~60ms)
-    alphaFast = std::exp (-1.0f / (0.002f * static_cast<float> (sampleRate)));
-    alphaSlow = std::exp (-1.0f / (0.060f * static_cast<float> (sampleRate)));
-    envFast = 0.0f;
-    envSlow = 0.0f;
+    // Ballistics for Crest Factor & Transient Detector
+    alphaFastAttack  = std::exp (-1.0f / (0.0015f * static_cast<float> (sampleRate)));
+    alphaFastRelease = std::exp (-1.0f / (0.025f * static_cast<float> (sampleRate)));
+    alphaRms         = std::exp (-1.0f / (0.060f * static_cast<float> (sampleRate)));
 
-    // Headless Auto-Gain & Phase Guard initial state
-    inRmsSmoothed = 0.0f;
+    peakFastMid = 0.0f;
+    rmsSlowMid  = 0.0f;
+
+    inRmsSmoothed  = 0.0f;
     outRmsSmoothed = 0.0f;
     autoGainFactor = 1.0f;
-    phaseGuardDucking = 1.0f;
 
     liveCorrelation.store (1.0f);
     smoothedCorrelation = 1.0f;
@@ -165,9 +168,10 @@ void FxSoundAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
 
 void FxSoundAudioProcessor::releaseResources()
 {
-    interleavedDfxBuffer.clear();
     lowBuffer.setSize (0, 0);
+    midBuffer.setSize (0, 0);
     highBuffer.setSize (0, 0);
+    upperBuffer.setSize (0, 0);
 }
 
 bool FxSoundAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -202,157 +206,141 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         return;
 
     // Read APVTS Macro Parameters
-    const float spatialMacro   = *apvts.getRawParameterValue ("spatial");       // 0.0 to 10.0
-    const float vocalPunchParam = *apvts.getRawParameterValue ("vocal_punch");  // 0.0 to 10.0
-    const float monoFreqParam  = *apvts.getRawParameterValue ("mono_freq");    // 80 to 250 Hz
+    const float spatialMacro    = *apvts.getRawParameterValue ("spatial");       // 0.0 to 10.0
+    const float vocalPunchParam = *apvts.getRawParameterValue ("vocal_punch");  // 0.0 to 10.0 (Transient Punch)
+    const float monoFreqParam   = *apvts.getRawParameterValue ("mono_freq");    // 80 to 250 Hz
     const float clarityAirParam = *apvts.getRawParameterValue ("clarity_air");  // 0.0 to 10.0
-    const float bassBoostParam = *apvts.getRawParameterValue ("bass_boost");    // 0.0 to 10.0
-    const float outputGainDb   = *apvts.getRawParameterValue ("output_gain");   // -12 to +12 dB
-    const bool guardEnabled    = *apvts.getRawParameterValue ("guard_active") > 0.5f;
+    const float outputGainDb    = *apvts.getRawParameterValue ("output_gain");   // -12 to +12 dB
 
-    // Update Crossover Frequencies
-    lowPassL.setCutoffFrequency (monoFreqParam);
-    lowPassR.setCutoffFrequency (monoFreqParam);
-    highPassL.setCutoffFrequency (monoFreqParam);
-    highPassR.setCutoffFrequency (monoFreqParam);
+    // Update Crossover 1 Frequency
+    xo1LowL.setCutoffFrequency (monoFreqParam);
+    xo1LowR.setCutoffFrequency (monoFreqParam);
+    xo1HighL.setCutoffFrequency (monoFreqParam);
+    xo1HighR.setCutoffFrequency (monoFreqParam);
 
-    // Configure FxSound Engine
-    // Map spatialMacro to FxSound Surround + Ambience + Dynamic Boost
-    const float fxSurround = juce::jmin (10.0f, spatialMacro * 0.85f);
-    const float fxAmbience = juce::jmin (10.0f, spatialMacro * 0.55f);
-    const float fxClarity  = juce::jmin (10.0f, (spatialMacro * 0.4f) + (clarityAirParam * 0.6f));
-    const float fxDynamic  = juce::jmin (10.0f, spatialMacro * 0.4f);
-    const float fxBass     = juce::jmin (10.0f, bassBoostParam);
+    // Resize buffers if necessary
+    if (lowBuffer.getNumSamples() < numSamples)
+    {
+        lowBuffer.setSize (2, numSamples, false, false, true);
+        midBuffer.setSize (2, numSamples, false, false, true);
+        highBuffer.setSize (2, numSamples, false, false, true);
+        upperBuffer.setSize (2, numSamples, false, false, true);
+    }
 
-    dfxDsp.setEffectValue (DfxDsp::Effect::Surround,     fxSurround);
-    dfxDsp.setEffectValue (DfxDsp::Effect::Ambience,     fxAmbience);
-    dfxDsp.setEffectValue (DfxDsp::Effect::Fidelity,     fxClarity);
-    dfxDsp.setEffectValue (DfxDsp::Effect::DynamicBoost, fxDynamic);
-    dfxDsp.setEffectValue (DfxDsp::Effect::Bass,         fxBass);
-    dfxDsp.setMasterGain (outputGainDb);
-
-    // Measure Incoming RMS for Headless Auto-Gain Equal-Loudness matching
     const float* inL = buffer.getReadPointer (0);
     const float* inR = (buffer.getNumChannels() > 1) ? buffer.getReadPointer (1) : inL;
 
+    // 1. Measure Dry Input RMS for Headless Auto-Gain Loudness Lock
     float inEnergy = 0.0f;
     for (int i = 0; i < numSamples; ++i)
         inEnergy += inL[i] * inL[i] + inR[i] * inR[i];
     float inRms = std::sqrt (inEnergy / (2.0f * numSamples + 1e-9f));
     inRmsSmoothed = (inRmsSmoothed < 1e-6f) ? inRms : (0.94f * inRmsSmoothed + 0.06f * inRms);
 
-    // Prepare Multiband Split Buffers
-    if (lowBuffer.getNumSamples() < numSamples)
-    {
-        lowBuffer.setSize (2, numSamples, false, false, true);
-        highBuffer.setSize (2, numSamples, false, false, true);
-    }
+    float* lowL   = lowBuffer.getWritePointer (0);
+    float* lowR   = lowBuffer.getWritePointer (1);
+    float* upperL = upperBuffer.getWritePointer (0);
+    float* upperR = upperBuffer.getWritePointer (1);
+    float* midL   = midBuffer.getWritePointer (0);
+    float* midR   = midBuffer.getWritePointer (1);
+    float* highL  = highBuffer.getWritePointer (0);
+    float* highR  = highBuffer.getWritePointer (1);
 
-    float* lowL = lowBuffer.getWritePointer (0);
-    float* lowR = lowBuffer.getWritePointer (1);
-    float* highL = highBuffer.getWritePointer (0);
-    float* highR = highBuffer.getWritePointer (1);
-
-    // 1. Crossover Filtering: Linkwitz-Riley 4th Order (Per-sample phase aligned)
+    // 2. Stage 1 Crossover: Separate Low (< mono_freq) and Upper (> mono_freq)
     for (int i = 0; i < numSamples; ++i)
     {
-        lowL[i]  = lowPassL.processSample (0, inL[i]);
-        lowR[i]  = lowPassR.processSample (0, inR[i]);
-        highL[i] = highPassL.processSample (0, inL[i]);
-        highR[i] = highPassR.processSample (0, inR[i]);
+        lowL[i]   = xo1LowL.processSample (0, inL[i]);
+        lowR[i]   = xo1LowR.processSample (0, inR[i]);
+        upperL[i] = xo1HighL.processSample (0, inL[i]);
+        upperR[i] = xo1HighR.processSample (0, inR[i]);
 
-        // Collapse Lows to Pure Mono (100% Phase Correlation Anchor)
+        // Pure mono anchor for sub-bass
         float monoLow = (lowL[i] + lowR[i]) * 0.5f;
         lowL[i] = monoLow;
         lowR[i] = monoLow;
     }
 
-    // 2. High-Frequency Band: Interleave for FxSound processing
-    if (interleavedDfxBuffer.size() < static_cast<size_t> (numSamples * 2))
-        interleavedDfxBuffer.resize (static_cast<size_t> (numSamples * 2));
-
+    // 3. Stage 2 Crossover: Separate Upper into Mid (mono_freq - 3.5kHz) and Air (> 3.5kHz)
     for (int i = 0; i < numSamples; ++i)
     {
-        interleavedDfxBuffer[i * 2]     = highL[i];
-        interleavedDfxBuffer[i * 2 + 1] = highR[i];
+        midL[i]  = xo2LowL.processSample (0, upperL[i]);
+        midR[i]  = xo2LowR.processSample (0, upperR[i]);
+        highL[i] = xo2HighL.processSample (0, upperL[i]);
+        highR[i] = xo2HighR.processSample (0, upperR[i]);
     }
 
-    // Process Mid-Highs with FxSound 3D Surround & Ambience
-    dfxDsp.processAudio (reinterpret_cast<short int*> (interleavedDfxBuffer.data()),
-                         reinterpret_cast<short int*> (interleavedDfxBuffer.data()),
-                         numSamples,
-                         0);
-
-    for (int i = 0; i < numSamples; ++i)
-    {
-        highL[i] = interleavedDfxBuffer[i * 2];
-        highR[i] = interleavedDfxBuffer[i * 2 + 1];
-    }
-
-    // 3. Spectral Transient / Sustain Mid-Side Processing (Ozone 12 & Pro-MB architecture)
-    // Headless Adaptive Phase Guard calculation
-    float targetDucking = 1.0f;
-    if (smoothedCorrelation < 0.45f)
-    {
-        // Smoothly duck side channel width if correlation approaches danger zone
-        targetDucking = juce::jlimit (0.25f, 1.0f, (smoothedCorrelation - 0.20f) / 0.25f);
-    }
-    phaseGuardDucking = 0.90f * phaseGuardDucking + 0.10f * targetDucking;
-
-    // Side channel width multiplier (guarded against extreme phase divergence)
-    const float baseWidthMultiplier = 1.0f + (spatialMacro * 0.05f); // 1.0x to 1.5x controlled width
-    const float effectiveSideWidth  = 1.0f + ((baseWidthMultiplier - 1.0f) * phaseGuardDucking);
-
-    // Mid channel saturation drive
-    const float solidDrive = 1.0f + (spatialMacro * 0.12f) + (vocalPunchParam * 0.20f);
-    const float solidMix   = juce::jmin (1.0f, 0.25f + (spatialMacro * 0.05f) + (vocalPunchParam * 0.05f));
-
+    // 4. Spectral Mid-Side Processing:
     float* outL = buffer.getWritePointer (0);
     float* outR = (buffer.getNumChannels() > 1) ? buffer.getWritePointer (1) : nullptr;
 
+    const float midPunchScale = vocalPunchParam * 0.08f;
+    const float airWidthScale = 1.0f + (spatialMacro * 0.06f) + (clarityAirParam * 0.03f); // 1.0x to 1.9x width in air
+
     for (int i = 0; i < numSamples; ++i)
     {
-        // High band M/S
-        float m = (highL[i] + highR[i]) * 0.5f;
-        float s = (highL[i] - highR[i]) * 0.5f;
+        // --- A. MID BAND PROCESSING (Vocal & Snare Core) ---
+        float mMid = (midL[i] + midR[i]) * 0.5f;
+        float sMid = (midL[i] - midR[i]) * 0.5f;
 
-        // Dual-Ballistic Envelope Follower (Fast ~2ms vs Slow ~60ms)
-        float absM = std::abs (m);
-        envFast = (absM > envFast) ? (0.35f * envFast + 0.65f * absM) : (alphaFast * envFast);
-        envSlow = (absM > envSlow) ? (0.05f * envSlow + 0.95f * absM) : (alphaSlow * envSlow);
+        // Crest Factor Detection on Mid channel
+        float absMMid = std::abs (mMid);
+        peakFastMid = (absMMid > peakFastMid)
+                    ? (0.55f * peakFastMid + 0.45f * absMMid)
+                    : (alphaFastRelease * peakFastMid);
+        rmsSlowMid  = alphaRms * rmsSlowMid + (1.0f - alphaRms) * (absMMid * absMMid);
+        float rmsMid = std::sqrt (rmsSlowMid + 1e-7f);
+        float crestFactor = peakFastMid / (rmsMid + 1e-4f);
 
-        float transientEnv = juce::jmax (0.0f, envFast - envSlow);
+        // Dynamic Transient Gain (Linear punch, zero clipping)
+        float punchBoost = 1.0f;
+        if (crestFactor > 1.15f)
+        {
+            float transientExcess = juce::jlimit (0.0f, 1.8f, crestFactor - 1.15f);
+            punchBoost += transientExcess * midPunchScale;
+        }
 
-        // MID CHANNEL: Inject Transient Punch & Solid Saturation on vocal band
-        float vocalBand = midBandpass.processSample (m);
-        float transientPunchBoost = 1.0f + (transientEnv * (vocalPunchParam * 0.6f));
-        float saturatedVocal = applySolidSaturation (vocalBand * transientPunchBoost, solidDrive);
-        float harmonicDelta = saturatedVocal - vocalBand;
-        float enhancedM = m + harmonicDelta * solidMix;
+        // Apply clean analog soft-knee saturation (prevents clipping peaks transparently)
+        float enhancedMMid = cleanAnalogSaturation (mMid * punchBoost);
 
-        // SIDE CHANNEL: Sustain-focused expansion with Adaptive Phase Guard
-        float enhancedS = s * effectiveSideWidth;
+        // Mid Band Side Limiter (Ensures Mid channel always dominates center, preserving correlation)
+        float desiredSMid = sMid * (1.0f + spatialMacro * 0.015f);
+        float maxAllowedSMid = 0.50f * (std::abs (enhancedMMid) + 1e-5f);
+        float enhancedSMid = juce::jlimit (-maxAllowedSMid, maxAllowedSMid, desiredSMid);
 
-        // Reconstruct Mid-High Stereo
-        float finalHighL = enhancedM + enhancedS;
-        float finalHighR = enhancedM - enhancedS;
+        // Reconstruct Mid Band Stereo
+        float midOutL = enhancedMMid + enhancedSMid;
+        float midOutR = enhancedMMid - enhancedSMid;
 
-        // Sum with Mono Low Anchor
-        float sL = lowL[i] + finalHighL;
-        float sR = lowR[i] + finalHighR;
+        // --- B. AIR BAND PROCESSING (Spatial Bloom & Shimmer > 3.5kHz) ---
+        float mHigh = (highL[i] + highR[i]) * 0.5f;
+        float sHigh = (highL[i] - highR[i]) * 0.5f;
 
-        outL[i] = sL;
+        // Expand Side Channel in Air band
+        float desiredSHigh = sHigh * airWidthScale;
+        // High Band Side Limiter (Guarantees Air band also never breaks phase)
+        float maxAllowedSHigh = 0.65f * (std::abs (mHigh) + 1e-5f);
+        float enhancedSHigh = juce::jlimit (-maxAllowedSHigh, maxAllowedSHigh, desiredSHigh);
+
+        // Reconstruct Air Band Stereo
+        float highOutL = mHigh + enhancedSHigh;
+        float highOutR = mHigh - enhancedSHigh;
+
+        // --- C. SPECTRAL SUMMATION ---
+        float finalL = lowL[i] + midOutL + highOutL;
+        float finalR = lowR[i] + midOutR + highOutR;
+
+        outL[i] = finalL;
         if (outR != nullptr)
-            outR[i] = sR;
+            outR[i] = finalR;
 
-        // Accumulate statistics for correlation measurement
-        sumDot += sL * sR;
-        sumL2  += sL * sL;
-        sumR2  += sR * sR;
+        // Accumulate Pearson Correlation Statistics
+        sumDot += finalL * finalR;
+        sumL2  += finalL * finalL;
+        sumR2  += finalR * finalR;
         correlationSampleCount++;
     }
 
-    // 4. Headless Perceptual Auto-Gain Compensator (Matches Output to Input RMS)
+    // 5. Headless Perceptual Auto-Gain (Equal-Loudness Match)
     float outEnergy = 0.0f;
     for (int i = 0; i < numSamples; ++i)
         outEnergy += outL[i] * outL[i] + (outR != nullptr ? outR[i] * outR[i] : outL[i] * outL[i]);
@@ -362,7 +350,7 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     if (inRmsSmoothed > 1e-4f && outRmsSmoothed > 1e-4f)
     {
         float targetAutoGain = inRmsSmoothed / outRmsSmoothed;
-        targetAutoGain = juce::jlimit (0.25f, 2.0f, targetAutoGain);
+        targetAutoGain = juce::jlimit (0.35f, 1.8f, targetAutoGain);
         autoGainFactor = 0.94f * autoGainFactor + 0.06f * targetAutoGain;
     }
 
@@ -370,14 +358,13 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     float masterTrim = juce::Decibels::decibelsToGain (outputGainDb);
     buffer.applyGain (autoGainFactor * masterTrim);
 
-    // 5. Real-Time Phase Correlation Calculation
+    // 6. Real-Time Phase Correlation Calculation
     if (correlationSampleCount >= 512)
     {
         float denom = std::sqrt (sumL2 * sumR2);
         float rawCorr = (denom > 1e-6f) ? (sumDot / denom) : 1.0f;
         rawCorr = juce::jlimit (-1.0f, 1.0f, rawCorr);
 
-        // Smooth correlation over time (leaky integrator)
         smoothedCorrelation = 0.85f * smoothedCorrelation + 0.15f * rawCorr;
         liveCorrelation.store (smoothedCorrelation, std::memory_order_relaxed);
 
