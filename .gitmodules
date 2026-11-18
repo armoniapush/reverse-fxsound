@@ -1,3 +1,6 @@
 [submodule "submodule"]
 	path = submodule
 	url = https://github.com/armoniapush/fxsound-app.git
+[submodule "libs/clap-juce-extensions"]
+	path = libs/clap-juce-extensions
+	url = https://github.com/free-audio/clap-juce-extensions.git
