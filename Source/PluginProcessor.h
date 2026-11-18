@@ -1,8 +1,10 @@
 #pragma once
 
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <juce_dsp/juce_dsp.h>
 #include <DfxDsp.h>
 #include <vector>
+#include <atomic>
 
 class FxSoundAudioProcessor : public juce::AudioProcessor
 {
@@ -37,16 +39,45 @@ public:
     void setStateInformation (const void* data, int sizeInBytes) override;
 
     juce::AudioProcessorValueTreeState& getAPVTS() { return apvts; }
-    int getNumBands() const { return numEqBands; }
-    float getBandFreq(int band) { return dfxDsp.getEqBandFrequency(band); }
+    float getLiveCorrelation() const { return liveCorrelation.load (std::memory_order_relaxed); }
 
 private:
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
+    // DFX DSP Engine
     DfxDsp dfxDsp;
+    std::vector<float> interleavedDfxBuffer;
+
+    // APVTS
     juce::AudioProcessorValueTreeState apvts;
-    std::vector<float> interleavedBuffer;
-    int numEqBands = 9;
+
+    // Linkwitz-Riley 4th-Order Crossover (LR4)
+    juce::dsp::LinkwitzRileyFilter<float> lowPassL, lowPassR;
+    juce::dsp::LinkwitzRileyFilter<float> highPassL, highPassR;
+
+    // Vocal Mid-Channel Bandpass (Spectre-style)
+    juce::dsp::IIR::Filter<float> midBandpass;
+
+    // Audio Buffers for multiband routing
+    juce::AudioBuffer<float> lowBuffer;
+    juce::AudioBuffer<float> highBuffer;
+
+    // Real-Time Correlation Calculation
+    std::atomic<float> liveCorrelation { 1.0f };
+    float smoothedCorrelation = 1.0f;
+    float sumDot = 0.0f;
+    float sumL2 = 0.0f;
+    float sumR2 = 0.0f;
+    int correlationSampleCount = 0;
+
+    // Solid Saturation Function
+    static inline float applySolidSaturation (float sample, float drive)
+    {
+        float in = sample * drive;
+        // Transistor soft-knee transfer function with 3rd-order harmonic dominance
+        float sat = std::tanh (in) + 0.12f * (in * in * (in > 0.0f ? 1.0f : -1.0f));
+        return sat * 0.88f;
+    }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FxSoundAudioProcessor)
 };

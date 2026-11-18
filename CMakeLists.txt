@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(FxSoundPlugin VERSION 1.0.0 LANGUAGES C CXX)
+project(FxSoundPlugin VERSION 0.0.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -54,6 +54,7 @@ target_link_libraries(FxSound PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/submodule/lib/Release-x64/DfxDsp.lib"
     "${CMAKE_CURRENT_SOURCE_DIR}/submodule/lib/Release-x64/audiopassthru.lib"
     juce::juce_audio_utils
+    juce::juce_dsp
     juce::juce_recommended_config_flags
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags

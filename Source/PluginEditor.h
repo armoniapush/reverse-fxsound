@@ -3,22 +3,34 @@
 #include "PluginProcessor.h"
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <juce_audio_processors/juce_audio_processors.h>
-#include <vector>
 #include <memory>
 
-class CustomRotaryLookAndFeel : public juce::LookAndFeel_V4
+class ModernSpatialLookAndFeel : public juce::LookAndFeel_V4
 {
 public:
-    CustomRotaryLookAndFeel();
+    ModernSpatialLookAndFeel();
     void drawRotarySlider (juce::Graphics& g, int x, int y, int width, int height,
                            float sliderPosProportional, float rotaryStartAngle,
                            float rotaryEndAngle, juce::Slider& slider) override;
-    void drawLinearSlider (juce::Graphics& g, int x, int y, int width, int height,
-                           float sliderPos, float minSliderPos, float maxSliderPos,
-                           const juce::Slider::SliderStyle style, juce::Slider& slider) override;
 };
 
-class FxSoundAudioProcessorEditor : public juce::AudioProcessorEditor
+class CorrelationMeterComponent : public juce::Component
+{
+public:
+    CorrelationMeterComponent() = default;
+    void setCorrelation (float val)
+    {
+        currentValue = juce::jlimit (-1.0f, 1.0f, val);
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override;
+
+private:
+    float currentValue = 1.0f;
+};
+
+class FxSoundAudioProcessorEditor : public juce::AudioProcessorEditor, private juce::Timer
 {
 public:
     explicit FxSoundAudioProcessorEditor (FxSoundAudioProcessor&);
@@ -31,46 +43,43 @@ private:
     using SliderAttachment = juce::AudioProcessorValueTreeState::SliderAttachment;
     using ButtonAttachment = juce::AudioProcessorValueTreeState::ButtonAttachment;
 
-    FxSoundAudioProcessor& audioProcessor;
-    CustomRotaryLookAndFeel customLookAndFeel;
+    void timerCallback() override;
 
-    // Header Components
+    FxSoundAudioProcessor& audioProcessor;
+    ModernSpatialLookAndFeel lookAndFeel;
+
+    // Header
     juce::Label titleLabel;
-    juce::Label subtitleLabel;
+    juce::Label badgeLabel;
     juce::ToggleButton powerButton { "POWER" };
     std::unique_ptr<ButtonAttachment> powerAttachment;
 
-    // 5 Signature Effects + Output Gain
-    struct EffectControl
+    // Master Macro Knob
+    juce::Slider masterSpatialSlider;
+    juce::Label masterSpatialLabel;
+    juce::Label masterValueLabel;
+    std::unique_ptr<SliderAttachment> spatialAttachment;
+
+    // Live Phase Correlation Meter
+    CorrelationMeterComponent correlationMeter;
+    juce::Label correlationTitleLabel;
+    juce::Label correlationReadoutLabel;
+
+    // Bottom Quick-Tweak Controls
+    struct MiniControl
     {
         juce::Slider slider;
-        juce::Label label;
+        juce::Label title;
         juce::Label valLabel;
         std::unique_ptr<SliderAttachment> attachment;
     };
 
-    EffectControl clarityCtrl;
-    EffectControl ambienceCtrl;
-    EffectControl surroundCtrl;
-    EffectControl dynamicBoostCtrl;
-    EffectControl bassBoostCtrl;
-    EffectControl outputGainCtrl;
+    MiniControl vocalPunchCtrl;
+    MiniControl monoFreqCtrl;
+    MiniControl clarityAirCtrl;
+    MiniControl outputGainCtrl;
 
-    // EQ Section
-    juce::ToggleButton eqToggle { "EQUALIZER ACTIVE" };
-    std::unique_ptr<ButtonAttachment> eqAttachment;
-
-    struct EqBandControl
-    {
-        juce::Slider slider;
-        juce::Label freqLabel;
-        juce::Label valLabel;
-        std::unique_ptr<SliderAttachment> attachment;
-    };
-    std::vector<std::unique_ptr<EqBandControl>> eqBands;
-
-    void setupRotaryControl (EffectControl& ctrl, const juce::String& paramId, const juce::String& name, const juce::String& suffix = "");
-    void setupEqBand (int index, const juce::String& freqText);
+    void setupMiniDial (MiniControl& ctrl, const juce::String& paramId, const juce::String& title, const juce::String& suffix = "");
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FxSoundAudioProcessorEditor)
 };

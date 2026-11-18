@@ -8,41 +8,34 @@ juce::AudioProcessorValueTreeState::ParameterLayout FxSoundAudioProcessor::creat
     params.push_back (std::make_unique<juce::AudioParameterBool> (
         juce::ParameterID ("power", 1), "Power", true));
 
+    // Master Macro Knob
     params.push_back (std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID ("clarity", 1), "Clarity",
+        juce::ParameterID ("spatial", 1), "Billboard Spatial",
+        juce::NormalisableRange<float> (0.0f, 10.0f, 0.1f), 5.0f));
+
+    // Secondary Fine-Tuning Controls
+    params.push_back (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID ("vocal_punch", 1), "Vocal Solid Punch",
         juce::NormalisableRange<float> (0.0f, 10.0f, 0.1f), 5.0f));
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID ("ambience", 1), "Ambience",
+        juce::ParameterID ("mono_freq", 1), "Mono Bass Crossover",
+        juce::NormalisableRange<float> (80.0f, 250.0f, 1.0f, 0.5f), 140.0f));
+
+    params.push_back (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID ("clarity_air", 1), "Clarity Air",
+        juce::NormalisableRange<float> (0.0f, 10.0f, 0.1f), 5.0f));
+
+    params.push_back (std::make_unique<juce::AudioParameterFloat> (
+        juce::ParameterID ("bass_boost", 1), "Sub Bass Density",
         juce::NormalisableRange<float> (0.0f, 10.0f, 0.1f), 3.0f));
-
-    params.push_back (std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID ("surround", 1), "Surround",
-        juce::NormalisableRange<float> (0.0f, 10.0f, 0.1f), 2.0f));
-
-    params.push_back (std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID ("dynamic_boost", 1), "Dynamic Boost",
-        juce::NormalisableRange<float> (0.0f, 10.0f, 0.1f), 4.0f));
-
-    params.push_back (std::make_unique<juce::AudioParameterFloat> (
-        juce::ParameterID ("bass_boost", 1), "Bass Boost",
-        juce::NormalisableRange<float> (0.0f, 10.0f, 0.1f), 5.0f));
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> (
         juce::ParameterID ("output_gain", 1), "Output Gain",
         juce::NormalisableRange<float> (-12.0f, 12.0f, 0.1f), 0.0f));
 
     params.push_back (std::make_unique<juce::AudioParameterBool> (
-        juce::ParameterID ("eq_on", 1), "EQ On", true));
-
-    for (int b = 0; b < 10; ++b)
-    {
-        auto paramId = "eq_band_" + juce::String (b);
-        auto paramName = "EQ Band " + juce::String (b + 1);
-        params.push_back (std::make_unique<juce::AudioParameterFloat> (
-            juce::ParameterID (paramId, 1), paramName,
-            juce::NormalisableRange<float> (-12.0f, 12.0f, 0.5f), 0.0f));
-    }
+        juce::ParameterID ("guard_active", 1), "Correlation Guard", true));
 
     return { params.begin(), params.end() };
 }
@@ -53,9 +46,10 @@ FxSoundAudioProcessor::FxSoundAudioProcessor()
                       .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "Parameters", createParameterLayout())
 {
-    numEqBands = dfxDsp.getNumEqBands();
-    if (numEqBands <= 0 || numEqBands > 10)
-        numEqBands = 9;
+    lowPassL.setType (juce::dsp::LinkwitzRileyFilterType::lowpass);
+    lowPassR.setType (juce::dsp::LinkwitzRileyFilterType::lowpass);
+    highPassL.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
+    highPassR.setType (juce::dsp::LinkwitzRileyFilterType::highpass);
 
     dfxDsp.powerOn (true);
     dfxDsp.eqOn (true);
@@ -118,17 +112,50 @@ void FxSoundAudioProcessor::changeProgramName (int index, const juce::String& ne
 
 void FxSoundAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    interleavedBuffer.resize (static_cast<size_t> (samplesPerBlock * 2));
-
-    // Configure FxSound DSP for 32-bit floating point, stereo, at host sample rate
+    // Configure FxSound DSP Engine
     dfxDsp.setSignalFormat (32, 2, static_cast<int> (sampleRate), 32);
     dfxDsp.powerOn (true);
     dfxDsp.eqOn (true);
+
+    interleavedDfxBuffer.resize (static_cast<size_t> (samplesPerBlock * 2));
+    lowBuffer.setSize (2, samplesPerBlock);
+    highBuffer.setSize (2, samplesPerBlock);
+
+    // Prepare Linkwitz-Riley Crossover Filters
+    juce::dsp::ProcessSpec spec;
+    spec.sampleRate = sampleRate;
+    spec.maximumBlockSize = static_cast<juce::uint32> (samplesPerBlock);
+    spec.numChannels = 1;
+
+    lowPassL.prepare (spec);
+    lowPassR.prepare (spec);
+    highPassL.prepare (spec);
+    highPassR.prepare (spec);
+
+    float initialCrossover = *apvts.getRawParameterValue ("mono_freq");
+    lowPassL.setCutoffFrequency (initialCrossover);
+    lowPassR.setCutoffFrequency (initialCrossover);
+    highPassL.setCutoffFrequency (initialCrossover);
+    highPassR.setCutoffFrequency (initialCrossover);
+
+    // Prepare Vocal Mid-Channel Bandpass (Spectre-style: ~935 Hz, Q=0.71)
+    auto coeffs = juce::dsp::IIR::Coefficients<float>::makeBandPass (sampleRate, 935.0f, 0.71f);
+    midBandpass.coefficients = coeffs;
+    midBandpass.reset();
+
+    liveCorrelation.store (1.0f);
+    smoothedCorrelation = 1.0f;
+    sumDot = 0.0f;
+    sumL2 = 0.0f;
+    sumR2 = 0.0f;
+    correlationSampleCount = 0;
 }
 
 void FxSoundAudioProcessor::releaseResources()
 {
-    interleavedBuffer.clear();
+    interleavedDfxBuffer.clear();
+    lowBuffer.setSize (0, 0);
+    highBuffer.setSize (0, 0);
 }
 
 bool FxSoundAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -157,60 +184,153 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
         buffer.clear (i, 0, numSamples);
 
-    // Check master bypass / power switch
+    // Master Bypass
     const bool isPowerOn = *apvts.getRawParameterValue ("power") > 0.5f;
     if (!isPowerOn)
         return;
 
-    // Push parameters into DfxDsp engine
-    dfxDsp.setEffectValue (DfxDsp::Effect::Fidelity,     *apvts.getRawParameterValue ("clarity"));
-    dfxDsp.setEffectValue (DfxDsp::Effect::Ambience,     *apvts.getRawParameterValue ("ambience"));
-    dfxDsp.setEffectValue (DfxDsp::Effect::Surround,     *apvts.getRawParameterValue ("surround"));
-    dfxDsp.setEffectValue (DfxDsp::Effect::DynamicBoost, *apvts.getRawParameterValue ("dynamic_boost"));
-    dfxDsp.setEffectValue (DfxDsp::Effect::Bass,         *apvts.getRawParameterValue ("bass_boost"));
-    dfxDsp.setMasterGain (*apvts.getRawParameterValue ("output_gain"));
+    // Read APVTS Macro Parameters
+    const float spatialMacro   = *apvts.getRawParameterValue ("spatial");       // 0.0 to 10.0
+    const float vocalPunchParam = *apvts.getRawParameterValue ("vocal_punch");  // 0.0 to 10.0
+    const float monoFreqParam  = *apvts.getRawParameterValue ("mono_freq");    // 80 to 250 Hz
+    const float clarityAirParam = *apvts.getRawParameterValue ("clarity_air");  // 0.0 to 10.0
+    const float bassBoostParam = *apvts.getRawParameterValue ("bass_boost");    // 0.0 to 10.0
+    const float outputGainDb   = *apvts.getRawParameterValue ("output_gain");   // -12 to +12 dB
+    const bool guardEnabled    = *apvts.getRawParameterValue ("guard_active") > 0.5f;
 
-    const bool eqEnabled = *apvts.getRawParameterValue ("eq_on") > 0.5f;
-    dfxDsp.eqOn (eqEnabled);
+    // Update Crossover Frequencies
+    lowPassL.setCutoffFrequency (monoFreqParam);
+    lowPassR.setCutoffFrequency (monoFreqParam);
+    highPassL.setCutoffFrequency (monoFreqParam);
+    highPassR.setCutoffFrequency (monoFreqParam);
 
-    if (eqEnabled)
+    // Configure FxSound Engine
+    // Map spatialMacro to FxSound Surround + Ambience + Dynamic Boost
+    const float fxSurround = juce::jmin (10.0f, spatialMacro * 0.85f);
+    const float fxAmbience = juce::jmin (10.0f, spatialMacro * 0.55f);
+    const float fxClarity  = juce::jmin (10.0f, (spatialMacro * 0.4f) + (clarityAirParam * 0.6f));
+    const float fxDynamic  = juce::jmin (10.0f, spatialMacro * 0.4f);
+    const float fxBass     = juce::jmin (10.0f, bassBoostParam);
+
+    dfxDsp.setEffectValue (DfxDsp::Effect::Surround,     fxSurround);
+    dfxDsp.setEffectValue (DfxDsp::Effect::Ambience,     fxAmbience);
+    dfxDsp.setEffectValue (DfxDsp::Effect::Fidelity,     fxClarity);
+    dfxDsp.setEffectValue (DfxDsp::Effect::DynamicBoost, fxDynamic);
+    dfxDsp.setEffectValue (DfxDsp::Effect::Bass,         fxBass);
+    dfxDsp.setMasterGain (outputGainDb);
+
+    // Prepare Multiband Split Buffers
+    if (lowBuffer.getNumSamples() < numSamples)
     {
-        for (int b = 0; b < numEqBands; ++b)
-        {
-            auto paramId = "eq_band_" + juce::String (b);
-            if (auto* param = apvts.getRawParameterValue (paramId))
-                dfxDsp.setEqBandBoostCut (b, *param);
-        }
+        lowBuffer.setSize (2, numSamples, false, false, true);
+        highBuffer.setSize (2, numSamples, false, false, true);
     }
 
-    // Interleave JUCE planar float buffer into L0, R0, L1, R1...
-    if (interleavedBuffer.size() < static_cast<size_t> (numSamples * 2))
-        interleavedBuffer.resize (static_cast<size_t> (numSamples * 2));
+    const float* inL = buffer.getReadPointer (0);
+    const float* inR = (buffer.getNumChannels() > 1) ? buffer.getReadPointer (1) : inL;
 
-    const float* leftIn  = buffer.getReadPointer (0);
-    const float* rightIn = (buffer.getNumChannels() > 1) ? buffer.getReadPointer (1) : leftIn;
+    float* lowL = lowBuffer.getWritePointer (0);
+    float* lowR = lowBuffer.getWritePointer (1);
+    float* highL = highBuffer.getWritePointer (0);
+    float* highR = highBuffer.getWritePointer (1);
+
+    // 1. Crossover Filtering: Linkwitz-Riley 4th Order (Per-sample phase aligned)
+    for (int i = 0; i < numSamples; ++i)
+    {
+        lowL[i]  = lowPassL.processSample (0, inL[i]);
+        lowR[i]  = lowPassR.processSample (0, inR[i]);
+        highL[i] = highPassL.processSample (0, inL[i]);
+        highR[i] = highPassR.processSample (0, inR[i]);
+
+        // Collapse Lows to Pure Mono (100% Phase Correlation Anchor)
+        float monoLow = (lowL[i] + lowR[i]) * 0.5f;
+        lowL[i] = monoLow;
+        lowR[i] = monoLow;
+    }
+
+    // 2. High-Frequency Band: Mid/Side Decomposition & Vocal Anchor
+    // Interleave High-Frequency band for FxSound processing
+    if (interleavedDfxBuffer.size() < static_cast<size_t> (numSamples * 2))
+        interleavedDfxBuffer.resize (static_cast<size_t> (numSamples * 2));
 
     for (int i = 0; i < numSamples; ++i)
     {
-        interleavedBuffer[i * 2]     = leftIn[i];
-        interleavedBuffer[i * 2 + 1] = rightIn[i];
+        interleavedDfxBuffer[i * 2]     = highL[i];
+        interleavedDfxBuffer[i * 2 + 1] = highR[i];
     }
 
-    // Process through the actual FxSound DSP library
-    dfxDsp.processAudio (reinterpret_cast<short int*> (interleavedBuffer.data()),
-                         reinterpret_cast<short int*> (interleavedBuffer.data()),
+    // Process Mid-Highs with FxSound 3D Surround & Ambience
+    dfxDsp.processAudio (reinterpret_cast<short int*> (interleavedDfxBuffer.data()),
+                         reinterpret_cast<short int*> (interleavedDfxBuffer.data()),
                          numSamples,
                          0);
 
-    // De-interleave processed samples back to audio buffer
-    float* leftOut  = buffer.getWritePointer (0);
-    float* rightOut = (buffer.getNumChannels() > 1) ? buffer.getWritePointer (1) : nullptr;
+    for (int i = 0; i < numSamples; ++i)
+    {
+        highL[i] = interleavedDfxBuffer[i * 2];
+        highR[i] = interleavedDfxBuffer[i * 2 + 1];
+    }
+
+    // 3. Mid Channel "Solid" Transistor Saturation (Spectre Mid-Focus)
+    // Drive scales with Macro Spatial + Vocal Punch trim
+    const float solidDrive = 1.0f + (spatialMacro * 0.15f) + (vocalPunchParam * 0.25f);
+    const float solidMix   = juce::jmin (1.0f, (spatialMacro * 0.08f) + (vocalPunchParam * 0.07f));
+
+    // Dynamic Width scaling on Side channel
+    const float widthMultiplier = 1.0f + (spatialMacro * 0.08f); // 1.0 to 1.8x width
+
+    float* outL = buffer.getWritePointer (0);
+    float* outR = (buffer.getNumChannels() > 1) ? buffer.getWritePointer (1) : nullptr;
 
     for (int i = 0; i < numSamples; ++i)
     {
-        leftOut[i] = interleavedBuffer[i * 2];
-        if (rightOut != nullptr)
-            rightOut[i] = interleavedBuffer[i * 2 + 1];
+        // High band M/S
+        float m = (highL[i] + highR[i]) * 0.5f;
+        float s = (highL[i] - highR[i]) * 0.5f;
+
+        // Spectre Solid: Extract vocal bandpass, saturate delta, blend back to Mid
+        float vocalBand = midBandpass.processSample (m);
+        float saturatedVocal = applySolidSaturation (vocalBand, solidDrive);
+        float harmonicDelta = saturatedVocal - vocalBand;
+        float enhancedM = m + harmonicDelta * solidMix;
+
+        // Expand Side Channel
+        float enhancedS = s * widthMultiplier;
+
+        // Reconstruct Mid-High Stereo
+        float finalHighL = enhancedM + enhancedS;
+        float finalHighR = enhancedM - enhancedS;
+
+        // Sum with Mono Low Anchor
+        float sL = lowL[i] + finalHighL;
+        float sR = lowR[i] + finalHighR;
+
+        outL[i] = sL;
+        if (outR != nullptr)
+            outR[i] = sR;
+
+        // Accumulate statistics for correlation measurement
+        sumDot += sL * sR;
+        sumL2  += sL * sL;
+        sumR2  += sR * sR;
+        correlationSampleCount++;
+    }
+
+    // 4. Real-Time Phase Correlation Calculation & Active Guard
+    if (correlationSampleCount >= 512)
+    {
+        float denom = std::sqrt (sumL2 * sumR2);
+        float rawCorr = (denom > 1e-6f) ? (sumDot / denom) : 1.0f;
+        rawCorr = juce::jlimit (-1.0f, 1.0f, rawCorr);
+
+        // Smooth correlation over time (leaky integrator)
+        smoothedCorrelation = 0.85f * smoothedCorrelation + 0.15f * rawCorr;
+        liveCorrelation.store (smoothedCorrelation, std::memory_order_relaxed);
+
+        sumDot = 0.0f;
+        sumL2  = 0.0f;
+        sumR2  = 0.0f;
+        correlationSampleCount = 0;
     }
 }
 
