@@ -35,13 +35,24 @@ target_sources(FxSound PRIVATE
     Source/PluginEditor.cpp
 )
 
+target_include_directories(FxSound PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/submodule/dsp/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/submodule/dsp/ptutil/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/submodule/audiopassthru/include
+)
+
 target_compile_definitions(FxSound PUBLIC
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
+    PT_NON_MFC
+    DSPSOFT_TARGET
+    PT_DSP_BUILD=PT_DSP_DFX
 )
 
 target_link_libraries(FxSound PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/submodule/lib/Release-x64/DfxDsp.lib"
+    "${CMAKE_CURRENT_SOURCE_DIR}/submodule/lib/Release-x64/audiopassthru.lib"
     juce::juce_audio_utils
     juce::juce_recommended_config_flags
     juce::juce_recommended_lto_flags

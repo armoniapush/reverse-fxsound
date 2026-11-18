@@ -1,6 +1,8 @@
 #pragma once
 
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <DfxDsp.h>
+#include <vector>
 
 class FxSoundAudioProcessor : public juce::AudioProcessor
 {
@@ -34,6 +36,17 @@ public:
     void getStateInformation (juce::MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
 
+    juce::AudioProcessorValueTreeState& getAPVTS() { return apvts; }
+    int getNumBands() const { return numEqBands; }
+    float getBandFreq(int band) { return dfxDsp.getEqBandFrequency(band); }
+
 private:
+    juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
+
+    DfxDsp dfxDsp;
+    juce::AudioProcessorValueTreeState apvts;
+    std::vector<float> interleavedBuffer;
+    int numEqBands = 9;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FxSoundAudioProcessor)
 };
