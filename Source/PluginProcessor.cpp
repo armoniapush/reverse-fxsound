@@ -172,13 +172,13 @@ void FxSoundAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
     peakFastMid = 0.0f;
     rmsSlowMid  = 0.0f;
 
-    // 5. Envelope-Follower RMS Correlation Guard (Sample-rate dependent musical ballistics)
+    // 5. Envelope-Follower L2 RMS Correlation Guard (150ms RMS, 25ms attack, 400ms release)
     midEnergyRms = 0.0f;
     sideEnergyRms = 0.0f;
     guardGainSmoothed = 1.0f;
-    alphaEnvSlow      = std::exp (-1.0f / (0.120f * static_cast<float> (sampleRate))); // 120 ms RMS integration
-    alphaGuardAttack  = std::exp (-1.0f / (0.020f * static_cast<float> (sampleRate))); // 20 ms attack
-    alphaGuardRelease = std::exp (-1.0f / (0.350f * static_cast<float> (sampleRate))); // 350 ms release
+    alphaEnvSlow      = std::exp (-1.0f / (0.150f * static_cast<float> (sampleRate))); // 150 ms L2 RMS
+    alphaGuardAttack  = std::exp (-1.0f / (0.025f * static_cast<float> (sampleRate))); // 25 ms attack
+    alphaGuardRelease = std::exp (-1.0f / (0.400f * static_cast<float> (sampleRate))); // 400 ms release
 
     // 6. Auto-Gain Perceptual Matching
     inRmsSmoothed  = 0.0f;
@@ -316,86 +316,53 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         float M = (xL + xR) * 0.5f;
         float S = (xL - xR) * 0.5f;
 
-        // --- 1. SALIENT / DIFFUSE DECOMPOSITION (AES Europe 2025 / US8855320B2) ---
-        float absM = std::abs (M);
-        peakFastMid = alphaFastAttack * peakFastMid + (1.0f - alphaFastAttack) * absM; // E_fast (~1.5 ms)
-        rmsSlowMid  = alphaFastRelease * rmsSlowMid + (1.0f - alphaFastRelease) * absM; // E_slow (~35-40 ms)
+        // 1. Mid 100% limpio (sin cleanAnalogSaturation que distorsione masters)
+        float enhancedM = M;
 
-        // Instantaneous transient mask m_T in [0, 1]
-        float mT = juce::jlimit (0.0f, 1.0f, 2.2f * (peakFastMid - rmsSlowMid) / (peakFastMid + 1e-6f));
-        float mD_factor = 1.0f - mT;
-
-        // Subtle silky 8 kHz Air lift on Mid
-        midAir8kLpState = alphaMidAir8k * midAir8kLpState + (1.0f - alphaMidAir8k) * M;
-        float mAir8k = M - midAir8kLpState;
-        float midWithAir = M + mAir8k * (spatialNorm * 0.04f + clarityAirParam * 0.008f);
-
-        // Mid stays 100% phase-intact (0 deg rotation) with FxSound Wide32.c Surround contrast (-2.1 dB)
-        float midContrast = 1.0f - (spatialNorm * 0.22f);
-        float enhancedM = cleanAnalogSaturation (midWithAir) * midContrast;
-
-        // --- 2. SUB-BASS ELLIPTICAL ANCHOR + MISSING FUNDAMENTAL HARMONIC SYNTHESIS ---
-        // Elliptical LR4 HPF on Side ONLY (< mono_freq -> S=0, rho=+1.00)
+        // 2. Side limpio por encima de mono_freq (sin ducking mT/mD_factor)
         float sMono = sideEllipticalHPF.processSample (0, S);
 
-        // Missing Fundamental: LPF_100(M) -> tanh(2.2 * B_sub) - B_sub -> BPF_130-380
-        float bSub = subBassLPF.processSample (M);
-        float bHarm = subHarmBPF.processSample (std::tanh (2.2f * bSub) - bSub);
+        // 3. Bandas paralelas + Armonicos estereo de subgrave (130-380 Hz)
+        float deltaPresence = sidePresenceBP.processSample (sMono);
+        float deltaAir      = sideAirHP.processSample (sMono);
+        float bSub  = subBassLPF.processSample (M);
+        float bHarm = subHarmBPF.processSample (std::tanh (2.5f * bSub) - bSub);
 
-        // Partition Side into Salient (untouched dry transient) & Diffuse (spatialized)
-        float sT = mT * sMono;
-        float sD = mD_factor * sMono;
-        float mD = mD_factor * M;
+        // Escalado musical estable (cero ducking)
+        float sExpanded = sMono * (1.0f + spatialNorm * 0.85f)
+                        + deltaPresence * (spatialNorm * 0.25f)
+                        + deltaAir      * (spatialNorm * 0.40f + clarityAirParam * 0.02f)
+                        + bHarm         * (spatialNorm * 0.45f);
 
-        // --- 3. DYNAMIC DiSP (LFO-Modulated Comb-Free All-Pass) + DELTA BANDS ---
-        float deltaPresence = sidePresenceBP.processSample (sD);
-        float deltaAir      = sideAirHP.processSample (sD);
+        // 4. Guardia RMS L2 real (rho >= +0.35 garantizado, sin bombeo)
+        midEnergyRms  = alphaEnvSlow * midEnergyRms  + (1.0f - alphaEnvSlow) * (enhancedM * enhancedM);
+        sideEnergyRms = alphaEnvSlow * sideEnergyRms + (1.0f - alphaEnvSlow) * (sExpanded * sExpanded);
 
-        midAirLpState = alphaMidAirHp * midAirLpState + (1.0f - alphaMidAirHp) * mD;
-        float mAirOnly = mD - midAirLpState;
+        float midRms  = std::sqrt (midEnergyRms + 1e-9f);
+        float sideRms = std::sqrt (sideEnergyRms + 1e-9f);
+        float maxSide = 0.694f * midRms;
 
-        float diffuseInput = sD + (mAirOnly * 0.42f);
-        float apOut = diffuseInput;
-        for (int k = 0; k < numAllPass; ++k)
-            apOut = allPassChain[k].processSample (apOut);
+        float targetGuard = (guardActive && midRms > 1e-4f && sideRms > maxSide && sideRms > 1e-5f)
+                          ? (maxSide / sideRms)
+                          : 1.0f;
+        float aG = (targetGuard < guardGainSmoothed) ? alphaGuardAttack : alphaGuardRelease;
+        guardGainSmoothed = aG * guardGainSmoothed + (1.0f - aG) * targetGuard;
 
-        float deltaDiffuse = diffusionLowPass.processSample (apOut);
+        float finalS = sExpanded * guardGainSmoothed;
+        float rawL = enhancedM + finalS;
+        float rawR = enhancedM - finalS;
 
-        // Surround expansion on Diffuse Side + Missing Fundamental Bass Width
-        float sideBaseGain = 1.0f + (spatialNorm * 2.50f); // up to 3.50x (+10.9 dB) on sustained/diffuse Side
-        float deltaS = deltaPresence * (spatialNorm * 0.45f)
-                     + deltaAir      * (spatialNorm * 0.55f + clarityAirParam * 0.035f)
-                     + deltaDiffuse  * (spatialNorm * 0.45f)
-                     + bHarm         * (spatialNorm * 0.30f);
+        // 5. Soft-clipper de seguridad a -0.35 dBFS (cero clipping digital)
+        auto softLimit = [] (float x) noexcept {
+            constexpr float thresh = 0.88f;
+            float ax = std::abs (x);
+            if (ax <= thresh) return x;
+            float over = thresh + 0.08f * std::tanh ((ax - thresh) / 0.08f);
+            return (x > 0.0f) ? over : -over;
+        };
 
-        float sD_proc = sD * sideBaseGain + deltaS;
-
-        // --- 4. CONSTANT-ENERGY PROJECTION & RMS CORRELATION GUARD (rho_min = 0.05 -> E_S,max = 0.95 * E_M) ---
-        float absMidVal  = std::abs (enhancedM);
-        float absSideVal = std::abs (sT + sD_proc);
-
-        midEnergyRms  = alphaEnvSlow * midEnergyRms  + (1.0f - alphaEnvSlow) * absMidVal;
-        sideEnergyRms = alphaEnvSlow * sideEnergyRms + (1.0f - alphaEnvSlow) * absSideVal;
-
-        float targetGuard = 1.0f;
-        if (guardActive && midEnergyRms > 1e-4f)
-        {
-            float maxAllowedSideEnergy = 0.95f * midEnergyRms; // Only prevents negative phase cancellation (rho < 0), never chokes SPATIAL!
-            if (sideEnergyRms > maxAllowedSideEnergy && sideEnergyRms > 1e-5f)
-                targetGuard = maxAllowedSideEnergy / sideEnergyRms;
-        }
-
-        if (targetGuard < guardGainSmoothed)
-            guardGainSmoothed = alphaGuardAttack * guardGainSmoothed + (1.0f - alphaGuardAttack) * targetGuard;
-        else
-            guardGainSmoothed = alphaGuardRelease * guardGainSmoothed + (1.0f - alphaGuardRelease) * targetGuard;
-
-        // Reconstruct: S_final = S_T + g_guard * S_D_proc (transients stay 100% untouched!)
-        float finalS = sT + guardGainSmoothed * sD_proc;
-
-        // --- 4. M/S RECONSTRUCTION ---
-        float finalL = enhancedM + finalS;
-        float finalR = enhancedM - finalS;
+        float finalL = softLimit (rawL);
+        float finalR = softLimit (rawR);
 
         outL[i] = finalL;
         if (outR != nullptr)
