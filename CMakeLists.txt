@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(FxSoundPlugin VERSION 0.0.2 LANGUAGES C CXX)
+project(FxSoundPlugin VERSION 0.0.3 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -64,4 +64,19 @@ target_link_libraries(FxSound PRIVATE
 clap_juce_extensions_plugin(TARGET FxSound
     CLAP_ID "com.armoniapush.fxsound"
     CLAP_FEATURES audio-effect equalizer
+)
+
+# Automatic Post-Build Deployment to System Plugin Directories
+add_custom_command(TARGET FxSound_VST3 POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "$<TARGET_FILE:FxSound_VST3>"
+        "C:/Program Files/Common Files/VST3/FxSound.vst3"
+    COMMENT "Auto-deploying VST3 to C:/Program Files/Common Files/VST3/FxSound.vst3"
+)
+
+add_custom_command(TARGET FxSound_CLAP POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "$<TARGET_FILE:FxSound_CLAP>"
+        "C:/Program Files/Common Files/CLAP/FxSound.clap"
+    COMMENT "Auto-deploying CLAP to C:/Program Files/Common Files/CLAP/FxSound.clap"
 )

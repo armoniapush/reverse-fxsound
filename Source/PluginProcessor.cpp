@@ -143,6 +143,18 @@ void FxSoundAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
     midBandpass.coefficients = coeffs;
     midBandpass.reset();
 
+    // Transient & Sustain Dual Envelope Follower (Fast ~2ms, Slow ~60ms)
+    alphaFast = std::exp (-1.0f / (0.002f * static_cast<float> (sampleRate)));
+    alphaSlow = std::exp (-1.0f / (0.060f * static_cast<float> (sampleRate)));
+    envFast = 0.0f;
+    envSlow = 0.0f;
+
+    // Headless Auto-Gain & Phase Guard initial state
+    inRmsSmoothed = 0.0f;
+    outRmsSmoothed = 0.0f;
+    autoGainFactor = 1.0f;
+    phaseGuardDucking = 1.0f;
+
     liveCorrelation.store (1.0f);
     smoothedCorrelation = 1.0f;
     sumDot = 0.0f;
@@ -219,15 +231,22 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     dfxDsp.setEffectValue (DfxDsp::Effect::Bass,         fxBass);
     dfxDsp.setMasterGain (outputGainDb);
 
+    // Measure Incoming RMS for Headless Auto-Gain Equal-Loudness matching
+    const float* inL = buffer.getReadPointer (0);
+    const float* inR = (buffer.getNumChannels() > 1) ? buffer.getReadPointer (1) : inL;
+
+    float inEnergy = 0.0f;
+    for (int i = 0; i < numSamples; ++i)
+        inEnergy += inL[i] * inL[i] + inR[i] * inR[i];
+    float inRms = std::sqrt (inEnergy / (2.0f * numSamples + 1e-9f));
+    inRmsSmoothed = (inRmsSmoothed < 1e-6f) ? inRms : (0.94f * inRmsSmoothed + 0.06f * inRms);
+
     // Prepare Multiband Split Buffers
     if (lowBuffer.getNumSamples() < numSamples)
     {
         lowBuffer.setSize (2, numSamples, false, false, true);
         highBuffer.setSize (2, numSamples, false, false, true);
     }
-
-    const float* inL = buffer.getReadPointer (0);
-    const float* inR = (buffer.getNumChannels() > 1) ? buffer.getReadPointer (1) : inL;
 
     float* lowL = lowBuffer.getWritePointer (0);
     float* lowR = lowBuffer.getWritePointer (1);
@@ -248,8 +267,7 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         lowR[i] = monoLow;
     }
 
-    // 2. High-Frequency Band: Mid/Side Decomposition & Vocal Anchor
-    // Interleave High-Frequency band for FxSound processing
+    // 2. High-Frequency Band: Interleave for FxSound processing
     if (interleavedDfxBuffer.size() < static_cast<size_t> (numSamples * 2))
         interleavedDfxBuffer.resize (static_cast<size_t> (numSamples * 2));
 
@@ -271,13 +289,23 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         highR[i] = interleavedDfxBuffer[i * 2 + 1];
     }
 
-    // 3. Mid Channel "Solid" Transistor Saturation (Spectre Mid-Focus)
-    // Drive scales with Macro Spatial + Vocal Punch trim
-    const float solidDrive = 1.0f + (spatialMacro * 0.15f) + (vocalPunchParam * 0.25f);
-    const float solidMix   = juce::jmin (1.0f, (spatialMacro * 0.08f) + (vocalPunchParam * 0.07f));
+    // 3. Spectral Transient / Sustain Mid-Side Processing (Ozone 12 & Pro-MB architecture)
+    // Headless Adaptive Phase Guard calculation
+    float targetDucking = 1.0f;
+    if (smoothedCorrelation < 0.45f)
+    {
+        // Smoothly duck side channel width if correlation approaches danger zone
+        targetDucking = juce::jlimit (0.25f, 1.0f, (smoothedCorrelation - 0.20f) / 0.25f);
+    }
+    phaseGuardDucking = 0.90f * phaseGuardDucking + 0.10f * targetDucking;
 
-    // Dynamic Width scaling on Side channel
-    const float widthMultiplier = 1.0f + (spatialMacro * 0.08f); // 1.0 to 1.8x width
+    // Side channel width multiplier (guarded against extreme phase divergence)
+    const float baseWidthMultiplier = 1.0f + (spatialMacro * 0.05f); // 1.0x to 1.5x controlled width
+    const float effectiveSideWidth  = 1.0f + ((baseWidthMultiplier - 1.0f) * phaseGuardDucking);
+
+    // Mid channel saturation drive
+    const float solidDrive = 1.0f + (spatialMacro * 0.12f) + (vocalPunchParam * 0.20f);
+    const float solidMix   = juce::jmin (1.0f, 0.25f + (spatialMacro * 0.05f) + (vocalPunchParam * 0.05f));
 
     float* outL = buffer.getWritePointer (0);
     float* outR = (buffer.getNumChannels() > 1) ? buffer.getWritePointer (1) : nullptr;
@@ -288,14 +316,22 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         float m = (highL[i] + highR[i]) * 0.5f;
         float s = (highL[i] - highR[i]) * 0.5f;
 
-        // Spectre Solid: Extract vocal bandpass, saturate delta, blend back to Mid
+        // Dual-Ballistic Envelope Follower (Fast ~2ms vs Slow ~60ms)
+        float absM = std::abs (m);
+        envFast = (absM > envFast) ? (0.35f * envFast + 0.65f * absM) : (alphaFast * envFast);
+        envSlow = (absM > envSlow) ? (0.05f * envSlow + 0.95f * absM) : (alphaSlow * envSlow);
+
+        float transientEnv = juce::jmax (0.0f, envFast - envSlow);
+
+        // MID CHANNEL: Inject Transient Punch & Solid Saturation on vocal band
         float vocalBand = midBandpass.processSample (m);
-        float saturatedVocal = applySolidSaturation (vocalBand, solidDrive);
+        float transientPunchBoost = 1.0f + (transientEnv * (vocalPunchParam * 0.6f));
+        float saturatedVocal = applySolidSaturation (vocalBand * transientPunchBoost, solidDrive);
         float harmonicDelta = saturatedVocal - vocalBand;
         float enhancedM = m + harmonicDelta * solidMix;
 
-        // Expand Side Channel
-        float enhancedS = s * widthMultiplier;
+        // SIDE CHANNEL: Sustain-focused expansion with Adaptive Phase Guard
+        float enhancedS = s * effectiveSideWidth;
 
         // Reconstruct Mid-High Stereo
         float finalHighL = enhancedM + enhancedS;
@@ -316,7 +352,25 @@ void FxSoundAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         correlationSampleCount++;
     }
 
-    // 4. Real-Time Phase Correlation Calculation & Active Guard
+    // 4. Headless Perceptual Auto-Gain Compensator (Matches Output to Input RMS)
+    float outEnergy = 0.0f;
+    for (int i = 0; i < numSamples; ++i)
+        outEnergy += outL[i] * outL[i] + (outR != nullptr ? outR[i] * outR[i] : outL[i] * outL[i]);
+    float outRms = std::sqrt (outEnergy / (2.0f * numSamples + 1e-9f));
+    outRmsSmoothed = (outRmsSmoothed < 1e-6f) ? outRms : (0.94f * outRmsSmoothed + 0.06f * outRms);
+
+    if (inRmsSmoothed > 1e-4f && outRmsSmoothed > 1e-4f)
+    {
+        float targetAutoGain = inRmsSmoothed / outRmsSmoothed;
+        targetAutoGain = juce::jlimit (0.25f, 2.0f, targetAutoGain);
+        autoGainFactor = 0.94f * autoGainFactor + 0.06f * targetAutoGain;
+    }
+
+    // Apply Auto-Gain and Master Output Gain Trim
+    float masterTrim = juce::Decibels::decibelsToGain (outputGainDb);
+    buffer.applyGain (autoGainFactor * masterTrim);
+
+    // 5. Real-Time Phase Correlation Calculation
     if (correlationSampleCount >= 512)
     {
         float denom = std::sqrt (sumL2 * sumR2);

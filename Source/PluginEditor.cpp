@@ -147,7 +147,7 @@ FxSoundAudioProcessorEditor::FxSoundAudioProcessorEditor (FxSoundAudioProcessor&
     titleLabel.setColour (juce::Label::textColourId, juce::Colour (0xff00e5ff));
     addAndMakeVisible (titleLabel);
 
-    badgeLabel.setText ("BILLBOARD SPATIAL V0.0.2", juce::dontSendNotification);
+    badgeLabel.setText ("BILLBOARD SPATIAL V0.0.3", juce::dontSendNotification);
     badgeLabel.setFont (juce::FontOptions (11.0f, juce::Font::bold));
     badgeLabel.setColour (juce::Label::textColourId, juce::Colour (0xffd500f9));
     addAndMakeVisible (badgeLabel);
@@ -198,7 +198,7 @@ FxSoundAudioProcessorEditor::FxSoundAudioProcessorEditor (FxSoundAudioProcessor&
     addAndMakeVisible (correlationReadoutLabel);
 
     // Bottom Quick-Tweak Controls
-    setupMiniDial (vocalPunchCtrl, "vocal_punch", "VOCAL PUNCH", "");
+    setupMiniDial (vocalPunchCtrl, "vocal_punch", "TRANSIENT PUNCH", "");
     setupMiniDial (monoFreqCtrl,   "mono_freq",   "MONO BASS",    " Hz");
     setupMiniDial (clarityAirCtrl, "clarity_air", "CLARITY AIR",  "");
     setupMiniDial (outputGainCtrl, "output_gain", "OUTPUT",       " dB");

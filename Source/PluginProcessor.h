@@ -70,6 +70,20 @@ private:
     float sumR2 = 0.0f;
     int correlationSampleCount = 0;
 
+    // Transient & Sustain Dual Envelope Follower (Ozone 12 architecture)
+    float envFast = 0.0f;
+    float envSlow = 0.0f;
+    float alphaFast = 0.0f;
+    float alphaSlow = 0.0f;
+
+    // Headless Auto-Gain Perceptual Matching (RMS Leveling)
+    float inRmsSmoothed = 0.0f;
+    float outRmsSmoothed = 0.0f;
+    float autoGainFactor = 1.0f;
+
+    // Headless Adaptive Phase Guard
+    float phaseGuardDucking = 1.0f;
+
     // Solid Saturation Function
     static inline float applySolidSaturation (float sample, float drive)
     {
